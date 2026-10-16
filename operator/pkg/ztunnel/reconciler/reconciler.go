@@ -46,7 +46,7 @@ type params struct {
 	DB                     *statedb.DB
 	ServiceAccountTable    statedb.Table[ServiceAccount]
 	EnrolledNamespaceTable statedb.RWTable[*table.EnrolledNamespace]
-	SpireClient            *spire.Client
+	SpireClient            *spire.EntryClient
 	Logger                 *slog.Logger
 	Lifecycle              cell.Lifecycle
 	Metrics                *Metrics

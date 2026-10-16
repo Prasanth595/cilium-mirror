@@ -67,7 +67,7 @@ func defaultTestEntryConfig() SpireEntryConfig {
 	return DefaultSpireEntryConfig()
 }
 
-func TestClient_Upsert(t *testing.T) {
+func TestEntryClient_Upsert(t *testing.T) {
 	cfg := ClientConfig{
 		SpiffeTrustDomain: "dummy.trusted.domain",
 	}
@@ -258,7 +258,7 @@ func TestClient_Upsert(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := &Client{
+			c := &EntryClient{
 				cfg:      cfg,
 				entryCfg: entryCfg,
 				entry:    tt.fields.entry,
@@ -270,7 +270,7 @@ func TestClient_Upsert(t *testing.T) {
 	}
 }
 
-func TestClient_Delete(t *testing.T) {
+func TestEntryClient_Delete(t *testing.T) {
 	cfg := ClientConfig{
 		SpiffeTrustDomain: "dummy.trusted.domain",
 	}
@@ -433,7 +433,7 @@ func TestClient_Delete(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := &Client{
+			c := &EntryClient{
 				cfg:      cfg,
 				entryCfg: entryCfg,
 				entry:    tt.fields.entry,
@@ -521,7 +521,7 @@ func addressOf[T any](v T) *T {
 	return &v
 }
 
-func TestClient_UpsertBatch(t *testing.T) {
+func TestEntryClient_UpsertBatch(t *testing.T) {
 	cfg := ClientConfig{
 		SpiffeTrustDomain: "dummy.trusted.domain",
 	}
@@ -677,7 +677,7 @@ func TestClient_UpsertBatch(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := &Client{
+			c := &EntryClient{
 				cfg:      cfg,
 				entryCfg: entryCfg,
 				entry:    tt.entry,
@@ -691,7 +691,7 @@ func TestClient_UpsertBatch(t *testing.T) {
 	}
 }
 
-func TestClient_DeleteBatch(t *testing.T) {
+func TestEntryClient_DeleteBatch(t *testing.T) {
 	cfg := ClientConfig{
 		SpiffeTrustDomain: "dummy.trusted.domain",
 	}
@@ -865,7 +865,7 @@ func TestClient_DeleteBatch(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := &Client{
+			c := &EntryClient{
 				cfg:      cfg,
 				entryCfg: entryCfg,
 				entry:    tt.entry,
