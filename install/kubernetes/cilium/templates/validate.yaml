@@ -173,6 +173,35 @@
 
 {{/* validate chart-managed SPIRE */}}
 {{- if and .Values.authentication.mutual.spire.enabled .Values.authentication.mutual.spire.install.enabled }}
+  {{- $server := .Values.authentication.mutual.spire.install.server }}
+  {{- if or (kindIs "string" $server.replicas) (not (regexMatch "^[1-9][0-9]*$" (toString $server.replicas))) (gt (int64 $server.replicas) 2147483647) }}
+    {{ fail "authentication.mutual.spire.install.server.replicas must be an integer between 1 and 2147483647." }}
+  {{- end }}
+  {{- if gt (int64 $server.replicas) 1 }}
+    {{- if not .Values.encryption.ztunnel.spire.useCRD }}
+      {{ fail "Multiple SPIRE servers require encryption.ztunnel.spire.useCRD=true; independent SQLite servers cannot share Entry API registration state." }}
+    {{- end }}
+    {{- if ne $server.service.type "ClusterIP" }}
+      {{ fail "Multiple SPIRE servers require authentication.mutual.spire.install.server.service.type=ClusterIP for ClientIP affinity." }}
+    {{- end }}
+    {{- if .Values.authentication.mutual.spire.serverAddress }}
+      {{ fail "Multiple chart-managed SPIRE servers require the chart's spire-server Service; leave authentication.mutual.spire.serverAddress unset." }}
+    {{- end }}
+  {{- end }}
+  {{- if and .Release.IsUpgrade (not $server.ca.upstreamSecret) }}
+    {{- $existing := lookup "apps/v1" "StatefulSet" .Values.authentication.mutual.spire.install.namespace "spire-server" }}
+    {{- if $existing }}
+      {{- $previousRoot := "" }}
+      {{- range $existing.spec.template.spec.volumes }}
+        {{- if eq .name "spire-upstream-ca" }}
+          {{- $previousRoot = .secret.secretName }}
+        {{- end }}
+      {{- end }}
+      {{- if ne $previousRoot (include "cilium.spire.upstreamSecret" .) }}
+        {{ fail "Changing the automatic SPIRE upstream root during an upgrade requires a planned trust migration. Set authentication.mutual.spire.install.server.ca.upstreamSecret explicitly; retain the existing shared root name when scaling down to one persistent server." }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
   {{- if .Values.encryption.ztunnel.spire.useCRD }}
     {{- range $name, $path := dict "agentSocketPath" .Values.authentication.mutual.spire.agentSocketPath "adminSocketPath" .Values.authentication.mutual.spire.adminSocketPath }}
       {{- if or (not (hasPrefix "/" $path)) (ne (clean $path) $path) (hasSuffix "/" $path) (eq (dir $path) "/") }}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -47,7 +48,9 @@ type spireRenderOptions struct {
 	// hasCRD makes both bundled SPIRE CRDs available.
 	hasCRD      bool
 	apiVersions []string
+	skipSchema  bool
 	values      map[string]any
+	lookup      func(string, string, string, string) (map[string]any, error)
 }
 
 func renderSpireChart(t *testing.T, opts spireRenderOptions, overrides ...string) (map[string]string, error) {
@@ -72,11 +75,14 @@ func renderSpireChart(t *testing.T, opts spireRenderOptions, overrides ...string
 		Namespace: "kube-system",
 		IsInstall: !opts.upgrade,
 		IsUpgrade: opts.upgrade,
-	}, caps, false)
+	}, caps, opts.skipSchema)
 	if err != nil {
 		return nil, err
 	}
 	renderer := engine.Engine{}
+	if opts.lookup != nil {
+		renderer.CustomTemplateFuncs = template.FuncMap{"lookup": opts.lookup}
+	}
 	rendered, err := renderer.RenderWithContext(t.Context(), chart, renderValues)
 	if err != nil {
 		return nil, err
@@ -249,22 +255,31 @@ func requireSpireControllerManagerRBAC(t *testing.T, rendered map[string]string,
 
 func TestSpireServerModes(t *testing.T) {
 	for _, tt := range []struct {
-		name       string
-		values     []string
-		crd        bool
-		disposable bool
+		name           string
+		values         []string
+		crd            bool
+		disposable     bool
+		replicas       int32
+		upstreamSecret string
 	}{
-		{name: "legacy", values: []string{"authentication.mutual.spire.enabled=true"}},
-		{name: "legacy ztunnel", values: []string{ztunnelSpireValues, "authentication.mutual.spire.install.enabled=true"}},
-		{name: "persistent CRD", values: []string{managedSpireCRD}, crd: true},
-		{name: "disposable single server", values: []string{managedSpireCRD, disposableSpire}, crd: true, disposable: true},
+		{name: "legacy", values: []string{"authentication.mutual.spire.enabled=true"}, replicas: 1},
+		{name: "legacy ztunnel", values: []string{ztunnelSpireValues, "authentication.mutual.spire.install.enabled=true"}, replicas: 1},
+		{name: "legacy custom root", values: []string{"authentication.mutual.spire.enabled=true,authentication.mutual.spire.install.server.ca.upstreamSecret=custom-root"}, replicas: 1, upstreamSecret: "custom-root"},
+		{name: "persistent CRD", values: []string{managedSpireCRD}, crd: true, replicas: 1},
+		{name: "two persistent servers", values: []string{managedSpireCRD, "authentication.mutual.spire.install.server.replicas=2"}, crd: true, replicas: 2, upstreamSecret: "spire-upstream-ca"},
+		{name: "three persistent servers", values: []string{managedSpireCRD, "authentication.mutual.spire.install.server.replicas=3"}, crd: true, replicas: 3, upstreamSecret: "spire-upstream-ca"},
+		{name: "disposable single server", values: []string{managedSpireCRD, disposableSpire}, crd: true, disposable: true, replicas: 1, upstreamSecret: "spire-upstream-ca"},
+		{name: "two disposable servers", values: []string{managedSpireCRD, disposableSpire, "authentication.mutual.spire.install.server.replicas=2"}, crd: true, disposable: true, replicas: 2, upstreamSecret: "spire-upstream-ca"},
+		{name: "single custom root", values: []string{managedSpireCRD, "authentication.mutual.spire.install.server.ca.upstreamSecret=custom-root"}, crd: true, replicas: 1, upstreamSecret: "custom-root"},
+		{name: "persistent custom root", values: []string{managedSpireCRD, "authentication.mutual.spire.install.server.replicas=2,authentication.mutual.spire.install.server.ca.upstreamSecret=custom-root"}, crd: true, replicas: 2, upstreamSecret: "custom-root"},
+		{name: "disposable custom root", values: []string{managedSpireCRD, disposableSpire, "authentication.mutual.spire.install.server.ca.upstreamSecret=custom-root"}, crd: true, disposable: true, replicas: 1, upstreamSecret: "custom-root"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			rendered, err := renderZtunnelSpire(t, tt.values...)
 			require.NoError(t, err)
 			sts := spireManifest[appsv1.StatefulSet](t, rendered, spireServerPath+"statefulset.yaml")
 			pod := sts.Spec.Template.Spec
-			require.Equal(t, int32(1), *sts.Spec.Replicas)
+			require.Equal(t, tt.replicas, *sts.Spec.Replicas)
 			require.Len(t, pod.Containers, 2)
 			require.Equal(t, !tt.crd, *pod.ShareProcessNamespace)
 			server := spireContainer(t, pod, "spire-server")
@@ -317,6 +332,8 @@ func TestSpireServerModes(t *testing.T) {
 			if tt.disposable {
 				require.Empty(t, sts.Spec.VolumeClaimTemplates)
 				require.NotNil(t, spireVolume(t, pod, "spire-data").EmptyDir)
+				require.Contains(t, config, `KeyManager "memory"`)
+				require.NotContains(t, config, `KeyManager "disk"`)
 			} else {
 				require.Len(t, sts.Spec.VolumeClaimTemplates, 1)
 				claim := sts.Spec.VolumeClaimTemplates[0]
@@ -327,18 +344,39 @@ func TestSpireServerModes(t *testing.T) {
 				for _, volume := range pod.Volumes {
 					require.NotEqual(t, "spire-data", volume.Name, "the StatefulSet must create a separate claim for each ordinal")
 				}
+				require.Contains(t, config, `KeyManager "disk"`)
+				require.Contains(t, config, `keys_path = "/run/spire/data/keys.json"`)
+				require.NotContains(t, config, `KeyManager "memory"`)
 			}
-			require.Contains(t, config, `KeyManager "disk"`)
-			require.Contains(t, config, `keys_path = "/run/spire/data/keys.json"`)
-			require.NotContains(t, config, "UpstreamAuthority")
-			for _, volume := range pod.Volumes {
-				require.NotEqual(t, "spire-upstream-ca", volume.Name)
+			if tt.upstreamSecret != "" {
+				require.Equal(t, int64(1000), *pod.SecurityContext.FSGroup)
+				require.Contains(t, config, `UpstreamAuthority "disk"`)
+				require.Contains(t, config, `cert_file_path = "/run/spire/upstream/tls.crt"`)
+				require.Contains(t, config, `key_file_path = "/run/spire/upstream/tls.key"`)
+				secret := spireVolume(t, pod, "spire-upstream-ca").Secret
+				require.Equal(t, tt.upstreamSecret, secret.SecretName)
+				require.Equal(t, int32(0440), *secret.DefaultMode)
+				require.Equal(t, []corev1.KeyToPath{{Key: "tls.crt", Path: "tls.crt"}, {Key: "tls.key", Path: "tls.key"}}, secret.Items)
+				require.Contains(t, server.VolumeMounts, corev1.VolumeMount{Name: "spire-upstream-ca", MountPath: "/run/spire/upstream", ReadOnly: true})
+			} else {
+				require.NotContains(t, config, "UpstreamAuthority")
+				for _, volume := range pod.Volumes {
+					require.NotEqual(t, "spire-upstream-ca", volume.Name)
+				}
 			}
 			service := spireManifest[corev1.Service](t, rendered, spireServerPath+"service.yaml")
 			require.Equal(t, sts.Spec.Selector.MatchLabels, service.Spec.Selector)
 			require.False(t, service.Spec.PublishNotReadyAddresses)
-			require.Empty(t, service.Spec.SessionAffinity)
-			require.Nil(t, pod.Affinity)
+			if tt.replicas > 1 {
+				require.Equal(t, corev1.ServiceAffinityClientIP, service.Spec.SessionAffinity)
+				terms := pod.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+				require.Len(t, terms, 1)
+				require.Equal(t, "kubernetes.io/hostname", terms[0].TopologyKey)
+				require.Equal(t, service.Spec.Selector, terms[0].LabelSelector.MatchLabels)
+			} else {
+				require.Empty(t, service.Spec.SessionAffinity)
+				require.Nil(t, pod.Affinity)
+			}
 		})
 	}
 }
@@ -481,7 +519,7 @@ func TestSpireInstallationOwnership(t *testing.T) {
 	}{
 		{},
 		{values: []string{ztunnelSpireValues}},
-		{values: []string{ztunnelSpireValues, ztunnelSpireCRD, "authentication.mutual.spire.install.crds.enabled=false"}},
+		{values: []string{ztunnelSpireValues, ztunnelSpireCRD, "authentication.mutual.spire.install.crds.enabled=false,authentication.mutual.spire.install.server.replicas=3"}},
 		{values: []string{ztunnelSpireValues, ztunnelSpireCRD}, wantCRD: true},
 		{values: []string{"authentication.mutual.spire.install.crds.enabled=true"}, wantCRD: true},
 	} {
@@ -511,6 +549,13 @@ func TestSpireInstallationOwnership(t *testing.T) {
 			require.Empty(t, strings.TrimSpace(rendered[spireServerPath+name]), name)
 		}
 	}
+	for _, mode := range []string{disposableSpire, "authentication.mutual.spire.install.server.replicas=2"} {
+		rendered, err := renderZtunnelSpire(t, managedSpireCRD, mode, "authentication.mutual.spire.annotations.owner=platform")
+		require.NoError(t, err)
+		namespace := spireManifest[corev1.Namespace](t, rendered, "cilium/templates/spire/namespace.yaml")
+		require.Equal(t, "keep", namespace.Annotations["helm.sh/resource-policy"])
+		require.Equal(t, "platform", namespace.Annotations["owner"])
+	}
 }
 
 // TestSpireNullMapOverrides checks that null SPIRE namespace annotations and
@@ -520,17 +565,23 @@ func TestSpireNullMapOverrides(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
 		values  []string
+		keep    bool
 		fsGroup bool
 	}{
 		{name: "Entry API", values: []string{"authentication.mutual.spire.enabled=true"}},
+		{name: "legacy custom root", values: []string{"authentication.mutual.spire.enabled=true,authentication.mutual.spire.install.server.ca.upstreamSecret=custom-root"}, keep: true, fsGroup: true},
 		{name: "CRD persistent", values: []string{managedSpireCRD}, fsGroup: true},
-		{name: "CRD disposable", values: []string{managedSpireCRD, disposableSpire}, fsGroup: true},
+		{name: "CRD disposable", values: []string{managedSpireCRD, disposableSpire}, keep: true, fsGroup: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			rendered, err := renderSpireChart(t, spireRenderOptions{hasCRD: true}, append(tt.values, nulls)...)
 			require.NoError(t, err)
 			namespace := spireManifest[corev1.Namespace](t, rendered, "cilium/templates/spire/namespace.yaml")
-			require.Empty(t, namespace.Annotations)
+			if tt.keep {
+				require.Equal(t, map[string]string{"helm.sh/resource-policy": "keep"}, namespace.Annotations)
+			} else {
+				require.Empty(t, namespace.Annotations)
+			}
 			securityContext := spireManifest[appsv1.StatefulSet](t, rendered, spireServerPath+"statefulset.yaml").Spec.Template.Spec.SecurityContext
 			if !tt.fsGroup {
 				require.Nil(t, securityContext)
@@ -808,7 +859,18 @@ func TestSpireInvalidConfigurations(t *testing.T) {
 		override string
 		error    string
 	}{
+		{"zero replicas", "authentication.mutual.spire.install.server.replicas=0", "replicas"},
+		{"negative replicas", "authentication.mutual.spire.install.server.replicas=-1", "replicas"},
+		{"fractional replicas", "authentication.mutual.spire.install.server.replicas=1.5", "replicas"},
+		{"boolean replicas", "authentication.mutual.spire.install.server.replicas=true", "replicas"},
+		{"invalid replicas", "authentication.mutual.spire.install.server.replicas=many", "replicas"},
+		{"overflow replicas", "authentication.mutual.spire.install.server.replicas=2147483648", "replicas"},
+		{"Entry API replicas", "encryption.ztunnel.spire.useCRD=false", "Multiple SPIRE servers require encryption.ztunnel.spire.useCRD=true"},
+		{"invalid root name", "authentication.mutual.spire.install.server.ca.upstreamSecret=bad_name", "upstreamSecret"},
+		{"invalid root type", "authentication.mutual.spire.install.server.ca.upstreamSecret=true", "upstreamSecret"},
 		{"invalid CRD override", "authentication.mutual.spire.install.crds.enabled=auto", "/crds/enabled"},
+		{"NodePort routing", "authentication.mutual.spire.install.server.service.type=NodePort", "service.type=ClusterIP"},
+		{"server override", "authentication.mutual.spire.serverAddress=other.example:8081", "leave authentication.mutual.spire.serverAddress unset"},
 		{"missing CRD", "authentication.mutual.spire.install.crds.enabled=false", "requires the ClusterSPIFFEID CRD"},
 		{"relative socket", "authentication.mutual.spire.adminSocketPath=relative/admin.sock", "clean absolute socket path"},
 		{"host root mount", "authentication.mutual.spire.adminSocketPath=/admin.sock", "non-root directory"},
@@ -818,7 +880,7 @@ func TestSpireInvalidConfigurations(t *testing.T) {
 		{"duplicate volume", "encryption.ztunnel.extraVolumes[0].name=spire-agent-socket", "Remove the spire-agent-socket"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := renderZtunnelSpire(t, managedSpireCRD, tt.override)
+			_, err := renderZtunnelSpire(t, managedSpireCRD, "authentication.mutual.spire.install.server.replicas=2", tt.override)
 			require.ErrorContains(t, err, tt.error)
 		})
 	}
@@ -831,6 +893,128 @@ func TestSpireInvalidConfigurations(t *testing.T) {
 		_, err = renderSpireChart(t, spireRenderOptions{upgrade: true, apiVersions: []string{"spire.spiffe.io/v1alpha1/ClusterStaticEntry"}}, values...)
 		require.ErrorContains(t, err, "the ClusterSPIFFEID CRD is missing")
 	}
+	for _, value := range []any{"2", 1.5, false, 0, -1, 2147483648} {
+		t.Run("schema", func(t *testing.T) {
+			values := map[string]any{"authentication": map[string]any{"mutual": map[string]any{"spire": map[string]any{"install": map[string]any{"server": map[string]any{"replicas": value}}}}}}
+			_, err := renderSpireChart(t, spireRenderOptions{values: values}, managedSpireCRD)
+			require.ErrorContains(t, err, "replicas")
+		})
+		t.Run("without schema", func(t *testing.T) {
+			values := map[string]any{"authentication": map[string]any{"mutual": map[string]any{"spire": map[string]any{"install": map[string]any{"server": map[string]any{"replicas": value}}}}}}
+			_, err := renderSpireChart(t, spireRenderOptions{values: values, skipSchema: true}, managedSpireCRD)
+			require.ErrorContains(t, err, "replicas must be an integer")
+		})
+	}
+}
+
+func TestSpireHAExampleAndRollout(t *testing.T) {
+	data, err := os.ReadFile("../../examples/kubernetes-ztunnel/spire-ha.yaml")
+	require.NoError(t, err)
+	values := map[string]any{}
+	require.NoError(t, yaml.UnmarshalStrict(data, &values))
+	for _, path := range [][]string{
+		{"authentication", "mutual", "spire", "install", "crds"},
+		{"authentication", "mutual", "spire", "install", "server", "dataStorage"},
+		{"authentication", "mutual", "spire", "install", "server", "ca"},
+	} {
+		_, found, err := unstructured.NestedFieldNoCopy(values, path...)
+		require.NoError(t, err)
+		require.False(t, found, "the ordinary example must not require %v", path)
+	}
+	rendered, err := renderSpireChart(t, spireRenderOptions{values: values})
+	require.NoError(t, err)
+	sts := spireManifest[appsv1.StatefulSet](t, rendered, spireServerPath+"statefulset.yaml")
+	require.Equal(t, int32(2), *sts.Spec.Replicas)
+	require.Len(t, sts.Spec.VolumeClaimTemplates, 1)
+	require.Equal(t, "spire-upstream-ca", spireVolume(t, sts.Spec.Template.Spec, "spire-upstream-ca").Secret.SecretName)
+	require.NotEmpty(t, rendered[spireCRDPath])
+	require.NotEmpty(t, rendered[spireCSIDCRDPath])
+	require.NotEmpty(t, strings.TrimSpace(rendered[ztunnelCSIDPath]))
+	changed, err := renderSpireChart(t, spireRenderOptions{values: values},
+		"authentication.mutual.spire.trustDomain=changed.example,authentication.mutual.spire.install.server.controllerManager.image.override=registry.example/controller:custom",
+		"authentication.mutual.spire.install.server.controllerManager.resources.requests.cpu=150m,authentication.mutual.spire.install.server.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].weight=100,authentication.mutual.spire.install.server.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].podAffinityTerm.topologyKey=kubernetes.io/hostname")
+	require.NoError(t, err)
+	next := spireManifest[appsv1.StatefulSet](t, changed, spireServerPath+"statefulset.yaml")
+	for _, key := range []string{"checksum/spire-server-config", "checksum/spire-controller-config"} {
+		require.NotEqual(t, sts.Spec.Template.Annotations[key], next.Spec.Template.Annotations[key])
+	}
+	beforeAgent := spireManifest[appsv1.DaemonSet](t, rendered, "cilium/templates/spire/agent/daemonset.yaml")
+	afterAgent := spireManifest[appsv1.DaemonSet](t, changed, "cilium/templates/spire/agent/daemonset.yaml")
+	require.NotEqual(t, beforeAgent.Spec.Template.Annotations["checksum/spire-agent-config"], afterAgent.Spec.Template.Annotations["checksum/spire-agent-config"])
+	controller := spireContainer(t, next.Spec.Template.Spec, "spire-controller-manager")
+	require.Equal(t, "registry.example/controller:custom", controller.Image)
+	require.Equal(t, int64(150), controller.Resources.Requests.Cpu().MilliValue())
+	require.Empty(t, next.Spec.Template.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution)
+}
+
+func TestSpirePersistentScale(t *testing.T) {
+	const storage = "authentication.mutual.spire.install.server.dataStorage.storageClass=managed-csi,authentication.mutual.spire.install.server.dataStorage.size=2Gi"
+	before, err := renderZtunnelSpire(t, managedSpireCRD, storage, "authentication.mutual.spire.install.server.replicas=2")
+	require.NoError(t, err)
+	after, err := renderZtunnelSpire(t, managedSpireCRD, storage, "authentication.mutual.spire.install.server.replicas=3")
+	require.NoError(t, err)
+	first := spireManifest[appsv1.StatefulSet](t, before, spireServerPath+"statefulset.yaml")
+	second := spireManifest[appsv1.StatefulSet](t, after, spireServerPath+"statefulset.yaml")
+	require.Equal(t, int32(3), *second.Spec.Replicas)
+	require.Equal(t, first.Spec.VolumeClaimTemplates, second.Spec.VolumeClaimTemplates)
+	require.Equal(t, first.Spec.Template, second.Spec.Template)
+	require.Equal(t, "managed-csi", *first.Spec.VolumeClaimTemplates[0].Spec.StorageClassName)
+	require.Equal(t, "2Gi", first.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests.Storage().String())
+}
+
+func TestSpireUpgradeTrust(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		previousRoot string
+		replicas     int
+		override     string
+		wantError    bool
+	}{
+		{name: "single unchanged", replicas: 1},
+		{name: "multiple unchanged", previousRoot: "spire-upstream-ca", replicas: 2},
+		{name: "automatic scale up", replicas: 2, wantError: true},
+		{name: "explicit migration", replicas: 2, override: "spire-upstream-ca"},
+		{name: "automatic scale down", previousRoot: "spire-upstream-ca", replicas: 1, wantError: true},
+		{name: "retain root on scale down", previousRoot: "spire-upstream-ca", replicas: 1, override: "spire-upstream-ca"},
+		{name: "custom root not replaced", previousRoot: "custom-root", replicas: 2, wantError: true},
+		{name: "retain custom root", previousRoot: "custom-root", replicas: 2, override: "custom-root"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			volumes := []any{}
+			if tt.previousRoot != "" {
+				volumes = append(volumes, map[string]any{"name": "spire-upstream-ca", "secret": map[string]any{"secretName": tt.previousRoot}})
+			}
+			lookups := 0
+			lookup := func(apiVersion, kind, namespace, name string) (map[string]any, error) {
+				if apiVersion != "apps/v1" || kind != "StatefulSet" {
+					return map[string]any{}, nil
+				}
+				require.Equal(t, "cilium-spire", namespace)
+				require.Equal(t, "spire-server", name)
+				lookups++
+				return map[string]any{"spec": map[string]any{"template": map[string]any{"spec": map[string]any{"volumes": volumes}}}}, nil
+			}
+			_, err := renderSpireChart(t, spireRenderOptions{upgrade: true, hasCRD: true, lookup: lookup},
+				managedSpireCRD, fmt.Sprintf("authentication.mutual.spire.install.server.replicas=%d,authentication.mutual.spire.install.server.ca.upstreamSecret=%s", tt.replicas, tt.override))
+			if tt.wantError {
+				require.ErrorContains(t, err, "Changing the automatic SPIRE upstream root")
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, tt.override == "", lookups == 1)
+		})
+	}
+	_, err := renderSpireChart(t, spireRenderOptions{
+		upgrade: true,
+		hasCRD:  true,
+		lookup: func(apiVersion, kind, namespace, name string) (map[string]any, error) {
+			if apiVersion == "apps/v1" && kind == "StatefulSet" {
+				return nil, errors.New("cannot read existing SPIRE StatefulSet")
+			}
+			return map[string]any{}, nil
+		},
+	}, managedSpireCRD)
+	require.ErrorContains(t, err, "cannot read existing SPIRE StatefulSet")
 }
 
 func TestSpireLegacyAgentRollout(t *testing.T) {

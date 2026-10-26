@@ -105,6 +105,7 @@ Netronome
 NewProto
 Nic
 O'Reilly
+PEM
 PaaS
 Packetization
 Palantir
@@ -776,6 +777,7 @@ runtimes
 sandboxing
 scaffoldings
 scalable
+schedulable
 scripttest
 sctl
 seccomp
@@ -915,6 +917,7 @@ unwinded
 upgradeCompatibility
 uplink
 uprobes
+upstreamSecret
 upstreamed
 uptime
 uretprobes

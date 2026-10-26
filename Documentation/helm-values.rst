@@ -141,7 +141,7 @@
      - bool
      - ``true``
    * - :spelling:ignore:`authentication.mutual.spire.install.existingNamespace`
-     - SPIRE namespace already exists. Set to true if Helm should not create, manage, and import the SPIRE namespace.
+     - SPIRE namespace already exists. Set to true if Helm should not create, manage, and import the SPIRE namespace. A chart-managed namespace is retained when an upstream root Secret is selected, including the automatic shared root, so uninstall does not indirectly delete it.
      - bool
      - ``false``
    * - :spelling:ignore:`authentication.mutual.spire.install.initImage`
@@ -153,7 +153,7 @@
      - string
      - ``"cilium-spire"``
    * - :spelling:ignore:`authentication.mutual.spire.install.server.affinity`
-     - SPIRE server affinity configuration
+     - SPIRE server affinity configuration. With multiple replicas and no explicit affinity, require separate nodes using kubernetes.io/hostname. Overriding this may remove protection against a node failure.
      - object
      - ``{}``
    * - :spelling:ignore:`authentication.mutual.spire.install.server.annotations`
@@ -168,6 +168,10 @@
      - SPIRE CA Subject
      - object
      - ``{"commonName":"Cilium SPIRE CA","country":"US","organization":"SPIRE"}``
+   * - :spelling:ignore:`authentication.mutual.spire.install.server.ca.upstreamSecret`
+     - Override the existing upstream root Secret in the SPIRE namespace, containing a self-signed root CA certificate (tls.crt) and its private key (tls.key). Empty selects spire-upstream-ca for multiple servers or disposable CRD-managed storage; a persistent single server keeps its own CA unless this override is set. Pin the existing shared root name when scaling back to one persistent server. The chart only mounts this Secret; it never generates, reads, rotates or deletes CA material. Changing roots requires a planned migration.
+     - string
+     - ``""``
    * - :spelling:ignore:`authentication.mutual.spire.install.server.controllerManager.image`
      - SPIRE controller-manager image. Keep the bundled CRDs compatible when overriding this image.
      - object
@@ -181,7 +185,7 @@
      - string
      - ``"ReadWriteOnce"``
    * - :spelling:ignore:`authentication.mutual.spire.install.server.dataStorage.enabled`
-     - Enable SPIRE server data storage
+     - Enable a separate PVC for every SPIRE server, including multiple replicas. These independent SQLite stores do not replicate SQL. Set false for advanced disposable storage. CRD mode then uses pod-local emptyDir storage and an existing shared root, even with one replica. Changing this setting requires StatefulSet recreation.
      - bool
      - ``true``
    * - :spelling:ignore:`authentication.mutual.spire.install.server.dataStorage.size`
@@ -209,13 +213,17 @@
      - object
      - ``{}``
    * - :spelling:ignore:`authentication.mutual.spire.install.server.podSecurityContext`
-     - Security context to be added to spire server pods. CRD-managed servers default to UID/GID/fsGroup 1000 and runAsNonRoot=true. These values override those defaults. SecurityContext holds pod-level security attributes and common container settings. ref: https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-pod
+     - Security context to be added to spire server pods. CRD-managed servers default to UID/GID/fsGroup 1000 and runAsNonRoot=true; legacy servers using an upstream root also default to fsGroup 1000. These values override those defaults. SecurityContext holds pod-level security attributes and common container settings. ref: https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-pod
      - object
      - ``{}``
    * - :spelling:ignore:`authentication.mutual.spire.install.server.priorityClassName`
      - The priority class to use for the spire server
      - string
      - ``""``
+   * - :spelling:ignore:`authentication.mutual.spire.install.server.replicas`
+     - Number of SPIRE server/controller pairs, not database replicas. More than one requires encryption.ztunnel.spire.useCRD=true, a ClusterIP Service, and an existing shared root Secret. Each server uses its own PVC by default. The shared root defaults to the spire-upstream-ca Secret; ca.upstreamSecret overrides its name.
+     - int
+     - ``1``
    * - :spelling:ignore:`authentication.mutual.spire.install.server.resources`
      - container resource limits & requests
      - object

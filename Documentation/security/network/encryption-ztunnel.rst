@@ -89,8 +89,8 @@ Set ``encryption.ztunnel.ca.type=spire``,
 ``encryption.ztunnel.spire.useCRD=true`` to use SPIRE for ztunnel workload
 certificates. The chart installs SPIRE when
 ``authentication.mutual.spire.install.enabled=true``. The default installation
-still uses a persistent SQLite datastore, the disk KeyManager, and the existing
-bootstrap sidecar.
+still uses one server, a persistent SQLite datastore, the disk KeyManager, and
+the existing bootstrap sidecar.
 
 Without ``encryption.ztunnel.spire.useCRD=true``, the chart neither wires
 ztunnel to SPIRE nor authorizes it as a SPIRE agent delegate, so ztunnel keeps
@@ -108,10 +108,12 @@ operator registers workloads through the SPIRE Entry API.
    cross-node traffic between enrolled workloads can fail. Plan the switch as
    a maintenance operation.
 
-For a new bundled installation, ``encryption.ztunnel.spire.useCRD=true`` is
-the only feature control. CRD installation, the controller, and bootstrap
-registration are derived from it. The existing SPIRE and ztunnel
-prerequisites still apply.
+For a new bundled installation, the two feature controls are
+``encryption.ztunnel.spire.useCRD=true`` and
+``authentication.mutual.spire.install.server.replicas``. CRD installation,
+controllers, bootstrap registration, and the shared-root reference are derived
+from those settings. The existing SPIRE/ztunnel enablement and the platform
+prerequisites below still apply.
 
 With CRD registration, the chart renders one ``ClusterSPIFFEID`` that selects
 namespaces labeled ``io.cilium/mtls-enabled=true``, the label that enrolls a
@@ -122,16 +124,17 @@ the SPIRE agent on the pod's node. ztunnel requests each workload certificate
 through the SPIRE agent's delegated identity API, which attests the pod by
 process ID. The operator does not register workloads in this mode.
 
-The SPIRE server pod runs a colocated ``spire-controller-manager`` that
-reconciles the ``ClusterSPIFFEID`` and ``ClusterStaticEntry`` resources into
-the server over a pod-local private API socket. The chart also supplies
-bootstrap ``ClusterStaticEntry`` resources for the SPIRE agent node alias,
-Cilium agent, Cilium operator, and ztunnel. The ztunnel entry provides the
-identity that the SPIRE agent authorizes as a delegate. Keeping the Cilium
-identities preserves other consumers of the SPIRE integration.
+Each server runs a colocated ``spire-controller-manager`` that reconciles the
+``ClusterSPIFFEID`` and ``ClusterStaticEntry`` resources into its own server
+over a pod-local private API socket. There is no leader election, shared
+SQLite database, or publisher component. The chart also supplies bootstrap
+``ClusterStaticEntry`` resources for the SPIRE agent node alias, Cilium agent,
+Cilium operator, and ztunnel. The ztunnel entry provides the identity that the
+SPIRE agent authorizes as a delegate. Keeping the Cilium identities preserves
+other consumers of the SPIRE integration.
 
 The controller watches pods, nodes, namespaces and endpoints in the whole
-cluster and keeps one entry per selected pod in the server. It ignores the
+cluster and keeps one entry per selected pod in each server. It ignores the
 ``kube-system``, ``kube-public`` and ``spire-system`` namespaces, so do not
 enroll those namespaces in CRD mode: their pods get no SPIRE entries, and
 ztunnel cannot obtain certificates for them.
@@ -152,15 +155,97 @@ identities, and ztunnel's SPIRE bundle lookup.
 Do not duplicate the managed socket mount paths in
 ``encryption.ztunnel.extraVolumeMounts``, even under different volume names.
 
-In CRD mode, the server keeps its SQLite database and disk KeyManager state on
-a persistent volume by default. With ``server.dataStorage.enabled=false``, it
-keeps them in pod-local ``emptyDir`` storage instead, so a replaced server pod
-starts with a new trust root. The private API socket is pod-local ``emptyDir``
-storage in either case. CRD-managed server pods default to UID/GID and
-``fsGroup`` 1000; ``server.podSecurityContext`` overrides these defaults.
+Single-server CRD registration
+------------------------------
+
+CRD registration does not require redundancy. Enable
+``encryption.ztunnel.spire.useCRD=true``, leave
+``authentication.mutual.spire.install.server.replicas=1``, and keep
+``server.dataStorage.enabled=true`` for a persistent single server. The bundled
+CRDs are installed automatically on a new release. A persistent single server
+keeps its own CA and does not require a new upstream root Secret unless
+``server.ca.upstreamSecret`` is explicitly set. For an existing release, follow
+the CRD installation and trust migration requirements below.
+
+Multiple SPIRE servers
+----------------------
+
+``authentication.mutual.spire.install.server.replicas`` controls the number of
+SPIRE server/controller pairs, not database replicas. Each server gets its own
+PVC by default. SQLite data is not replicated between servers; their controllers
+reconcile the same CRD registration intent into independent stores.
+
+More than one server requires CRD registration, an existing shared root CA
+Secret, and a ``ClusterIP`` Service. The root reference automatically selects
+``spire-upstream-ca`` in the SPIRE namespace. Override
+``authentication.mutual.spire.install.server.ca.upstreamSecret`` only when a
+different existing Secret is required. The chart rejects unsupported
+combinations rather than creating unrelated trust roots.
+
+Before installing, provision the following outside this chart:
+
+* The existing ``cilium-ztunnel-secrets`` Secret in the Cilium namespace, as
+  described above. The current Cilium xDS server still needs its bootstrap and
+  built-in CA key/certificate files even when ztunnel requests workload
+  certificates from SPIRE.
+* An existing SPIRE namespace and its ``spire-upstream-ca`` Secret containing
+  ``tls.crt`` (one PEM-encoded self-signed root CA certificate) and ``tls.key``
+  (its matching private key).
+  The certificate must permit CA signing and at least one intermediate CA.
+  Its validity must cover the SPIRE issuing CA lifetime. Back up and manage
+  this root using your platform's CA lifecycle procedures.
+* A suitable default StorageClass, or an explicit
+  ``server.dataStorage.storageClass``, that can provision one ReadWriteOnce PVC
+  per replica. Each claim requests 1 GiB by default. Account for disk topology
+  and attachment constraints when selecting storage and node placement.
+* At least as many schedulable Linux nodes as server replicas. Unless
+  ``server.affinity`` is explicitly supplied, multiple servers require
+  different nodes using ``kubernetes.io/hostname`` anti-affinity. Overriding
+  placement can remove protection against node failure.
+
+The following values describe a new release using an existing
+``cilium-spire`` namespace. They need no CRD-installation, storage-mode, or
+root-name override:
+
+.. literalinclude:: ../../../examples/kubernetes-ztunnel/spire-ha.yaml
+   :language: yaml
+
+For a source checkout, render the complete installation without contacting a
+cluster using:
+
+.. code-block:: shell-session
+
+    helm template cilium ./install/kubernetes/cilium --namespace kube-system \
+      --include-crds --values ./examples/kubernetes-ztunnel/spire-ha.yaml
+
+The StatefulSet creates claims such as ``spire-data-spire-server-0`` and
+``spire-data-spire-server-1``. Each stores that server's SQLite database and disk
+KeyManager state. No SQLite file is shared. Scaling from two to three servers
+adds a new claim without changing existing claim templates or deleting data.
+
+Each server uses the disk UpstreamAuthority to obtain its own issuing CA from
+the same root. The controller does not mount the root key. The private API
+socket remains pod-local ``emptyDir`` storage, independent of database
+persistence. CRD-managed server pods default to UID/GID and ``fsGroup`` 1000;
+``server.podSecurityContext`` overrides these defaults.
 ``server.securityContext`` applies to both containers so their socket
 permissions remain compatible. Keep a suitable ``fsGroup`` when changing UIDs
-so the data volume remains accessible.
+so the Secret and data volumes remain accessible.
+Legacy servers using an explicit upstream root also default to ``fsGroup``
+1000 so the projected Secret is readable; their other security defaults are
+unchanged.
+
+The Service selects all ready server pods and uses ``ClientIP`` affinity to
+keep each agent on one datastore. Attested-node state is not replicated.
+Agents must re-attest when they move to another server. This topology is for
+X.509-SVIDs; it does not provide JWT-SVID key replication or guarantee
+uninterrupted certificate requests during failover.
+
+For advanced disposable storage, explicitly set
+``server.dataStorage.enabled=false``. CRD mode then uses ``emptyDir`` SQLite
+storage and an in-memory KeyManager. The conventional shared root is selected
+even with one replica, so local-store loss does not replace the trust root.
+This is not the default and is not selected when the replica count changes.
 
 CRD ownership and upgrades
 --------------------------
@@ -218,7 +303,8 @@ plus get/patch/update on the status of both resource types. The chart grants
 these through a separate ``<server ServiceAccount>-controller-manager``
 ClusterRole and ClusterRoleBinding that exist only with CRD registration,
 ``rbac.create=true`` and ``server.serviceAccount.create=true``. The operator
-needs no SPIRE CRD permissions.
+needs no SPIRE CRD permissions. No component needs Kubernetes API permission
+to read the root Secret; Kubernetes mounts it into the server.
 For compatibility with existing bundled installations, the bundle ConfigMap
 RoleBinding remains chart-managed regardless of ``rbac.create`` or
 ``server.serviceAccount.create``. Its Role is chart-managed when
@@ -232,23 +318,48 @@ Migration and verification
 --------------------------
 
 Treat migration from the legacy installation as a planned maintenance
-operation:
+operation, not a replica-count-only upgrade:
 
 * Preserve and back up the existing trust root and registration intent before
-  changing producers or storage. Moving to an unrelated root requires a
-  coordinated trust migration and certificate refresh.
+  changing producers, storage, or upstream CA settings. Moving to an unrelated
+  root requires a coordinated trust migration and certificate refresh.
+* Before scaling a persistent single server to multiple servers, prepare the
+  shared root and explicitly set ``server.ca.upstreamSecret`` after planning
+  the trust migration. When scaling back to one persistent server, retain the
+  existing shared root name with that same override.
+  On a connected upgrade, the chart reads only the existing StatefulSet's
+  root reference and rejects an automatic root transition. It never reads
+  Secret contents. Offline rendering cannot verify the previous root.
 * Install the CRDs before enabling CRD registration on an existing release.
   Explicitly migrate or retire the Entry API registrations that the operator
-  created; the controller deliberately leaves unprefixed entries alone.
+  created; the controller deliberately leaves unprefixed entries alone. Other
+  direct-API producers must not rely on writes reaching every independent
+  server.
 * Enabling CRD registration moves workload identities to the configured
   trust domain. Expect cross-node traffic between enrolled workloads to fail
   until every Cilium agent and ztunnel pod has rolled out.
+* The PVC default applies at every replica count. Changing
+  ``volumeClaimTemplates`` is not supported by an in-place StatefulSet update.
+  Moving between PVC and disposable storage requires explicit StatefulSet
+  recreation with the intended values. The chart does not destroy old PVCs
+  or convert their contents. Retain explicit storage settings when upgrading
+  an installation that intentionally uses disposable storage.
+* Use ``install.existingNamespace=true`` for a namespace already managed
+  outside this release. A chart-managed SPIRE namespace with an upstream root
+  reference is annotated for retention so uninstall does not delete that root
+  indirectly. Do not change namespace ownership during the same migration.
+* The chart neither generates nor reads the root Secret during rendering and
+  does not automate root rotation. Root changes require explicit lifecycle
+  planning; do not treat replacing Secret contents as a safe rotation procedure.
 
-Before relying on CRD registration, verify registration entries on the server,
+Before relying on redundancy, verify registration entries on **each** server,
 agent attestation, and cross-node mTLS in an isolated test environment. Pod
-readiness does not prove that registration has converged: controller v0.6.2's
-readiness endpoint checks controller health, not successful reconciliation of
-every entry.
+readiness and the controller's shared resource status do not prove that every
+replica has converged. In particular, controller v0.6.2's readiness endpoint
+checks controller health, not successful reconciliation of every entry.
+Exercise pod loss, node loss, local-store loss, and certificate renewal with
+your cluster's routing and storage behavior. Helm rendering alone cannot prove
+runtime failover.
 
 External SPIRE
 --------------

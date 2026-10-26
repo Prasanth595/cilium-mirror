@@ -52,12 +52,28 @@ data:
           }
         }
       }
+      {{- if and .Values.encryption.ztunnel.spire.useCRD (not .Values.authentication.mutual.spire.install.server.dataStorage.enabled) }}
+
+      KeyManager "memory" {
+        plugin_data {}
+      }
+      {{- else }}
 
       KeyManager "disk" {
         plugin_data {
           keys_path = "/run/spire/data/keys.json"
         }
       }
+      {{- end }}
+      {{- if include "cilium.spire.upstreamSecret" . }}
+
+      UpstreamAuthority "disk" {
+        plugin_data {
+          cert_file_path = "/run/spire/upstream/tls.crt"
+          key_file_path = "/run/spire/upstream/tls.key"
+        }
+      }
+      {{- end }}
 
       Notifier "k8sbundle" {
         plugin_data {

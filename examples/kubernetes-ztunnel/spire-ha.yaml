@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Authors of Cilium
+#
+# For a new Helm release. The two feature controls are useCRD and replicas.
+# Existing releases must preinstall the CRDs and plan the trust migration.
+# Prerequisites: the existing cilium-ztunnel-secrets Secret in the Cilium
+# namespace, spire-upstream-ca (tls.crt/tls.key) in cilium-spire, a suitable
+# default StorageClass, and at least two schedulable Linux nodes.
+encryption:
+  enabled: true
+  type: ztunnel
+  ztunnel:
+    ca:
+      type: spire
+    spire:
+      useCRD: true
+authentication:
+  mutual:
+    spire:
+      enabled: true
+      trustDomain: spiffe.cilium
+      install:
+        enabled: true
+        namespace: cilium-spire
+        existingNamespace: true
+        server:
+          replicas: 2
