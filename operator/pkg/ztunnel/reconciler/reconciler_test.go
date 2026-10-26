@@ -22,6 +22,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	ciliumhive "github.com/cilium/cilium/pkg/hive"
+	"github.com/cilium/cilium/pkg/hive/health"
+	healthtypes "github.com/cilium/cilium/pkg/hive/health/types"
 	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/ztunnel/table"
@@ -101,6 +104,7 @@ func setupTest(t *testing.T) (*statedb.DB, statedb.RWTable[*table.EnrolledNamesp
 
 	mock := newMockSpireClient()
 	logger := hivetest.Logger(t)
+	health, _ := cell.NewSimpleHealth()
 
 	ops := &EnrollmentReconciler{
 		db:                     db,
@@ -110,6 +114,7 @@ func setupTest(t *testing.T) (*statedb.DB, statedb.RWTable[*table.EnrolledNamesp
 		enrolledNamespaceTable: enrolledTbl,
 		metrics:                NewMetrics(),
 		mu:                     semaphore.NewWeighted(1),
+		initializationHealth:   health,
 	}
 
 	return db, enrolledTbl, saTbl, mock, ops
@@ -743,7 +748,7 @@ func TestEnrollmentReconciler_Stop_CancelsBlockedNamespaceJob(t *testing.T) {
 		job.Cell,
 		cell.Invoke(func(lc cell.Lifecycle, registry job.Registry) {
 			ops = NewEnrollmentReconciler(params{
-				DB: db, Logger: log, Lifecycle: lc, Metrics: NewMetrics(),
+				DB: db, Logger: log, Lifecycle: lc, Metrics: NewMetrics(), Health: health,
 				SpireClient: mock, ServiceAccountTable: saTbl, EnrolledNamespaceTable: enrolledTbl,
 			}).(*EnrollmentReconciler)
 			// Static StateDB jobs are likewise registered after the watcher hook.
@@ -793,6 +798,93 @@ func TestEnrollmentReconciler_Stop_CancelsBlockedNamespaceJob(t *testing.T) {
 		t.Fatal("watcher stop did not cancel its stalled backend request")
 	}
 	require.Empty(t, mutations, "cancelled namespace job must not mutate the backend")
+}
+
+func TestEnrollmentReconciler_InitializationHealth(t *testing.T) {
+	for _, method := range []string{"update", "delete"} {
+		for _, cancelWait := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/cancel=%t", method, cancelWait), func(t *testing.T) {
+				db, enrolledTbl, saTbl, mock, ops := setupTest(t)
+				initializeTables(db, saTbl, enrolledTbl)
+				if method == "update" {
+					enrollNamespace(db, enrolledTbl, "shop")
+				}
+				mock.initialized = make(chan struct{})
+				health, status := cell.NewSimpleHealth()
+				ops.initializationHealth = health
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				done := make(chan error, 1)
+				go func() {
+					op := ops.Update
+					if method == "delete" {
+						op = ops.Delete
+					}
+					done <- op(ctx, db.ReadTxn(), 0, &table.EnrolledNamespace{Name: "shop"})
+				}()
+				require.Eventually(t, func() bool {
+					status.Lock()
+					defer status.Unlock()
+					return status.Level == cell.StatusDegraded
+				}, time.Second, time.Millisecond)
+				require.Error(t, status.Error)
+				select {
+				case err := <-done:
+					t.Fatalf("initialization must still be pending: %v", err)
+				default:
+				}
+				if cancelWait {
+					cancel()
+				} else {
+					close(mock.initialized)
+				}
+				select {
+				case err := <-done:
+					if cancelWait {
+						require.ErrorIs(t, err, context.Canceled)
+						require.Equal(t, cell.StatusDegraded, status.Level)
+					} else {
+						require.NoError(t, err)
+						require.Equal(t, cell.StatusOK, status.Level)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("initialization wait did not finish")
+				}
+			})
+		}
+	}
+}
+
+func TestEnrollmentReconciler_InitializationProductionHealth(t *testing.T) {
+	db, enrolledTbl, saTbl, mock, ops := setupTest(t)
+	initializeTables(db, saTbl, enrolledTbl)
+	mock.initialized = make(chan struct{})
+	var healthDB *statedb.DB
+	var statuses statedb.Table[healthtypes.Status]
+	h := ciliumhive.New(cell.Invoke(func(reporter cell.Health, db *statedb.DB, table statedb.Table[healthtypes.Status]) {
+		ops.initializationHealth = reporter.NewScope("spire-initialization")
+		healthDB, statuses = db, table
+	}))
+	require.NoError(t, h.Populate(hivetest.Logger(t)))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	mock.initializedFunc = func() <-chan struct{} {
+		cancel()
+		return mock.initialized
+	}
+	require.NotPanics(t, func() {
+		require.ErrorIs(t, ops.waitForInitialization(ctx), context.Canceled)
+	})
+	degraded := statedb.Collect(statuses.List(healthDB.ReadTxn(), health.StatusByLevel(healthtypes.LevelDegraded)))
+	require.Len(t, degraded, 1)
+	require.NotEmpty(t, degraded[0].Error)
+	mock.initializedFunc = nil
+	close(mock.initialized)
+	require.NoError(t, ops.waitForInitialization(t.Context()))
+	require.Empty(t, statedb.Collect(statuses.List(healthDB.ReadTxn(), health.StatusByLevel(healthtypes.LevelDegraded))))
+	healthy := statedb.Collect(statuses.List(healthDB.ReadTxn(), health.StatusByLevel(healthtypes.LevelOK)))
+	require.Len(t, healthy, 1)
+	require.Empty(t, healthy[0].Error)
 }
 
 func TestEnrollmentReconciler_SerializationCancellation(t *testing.T) {

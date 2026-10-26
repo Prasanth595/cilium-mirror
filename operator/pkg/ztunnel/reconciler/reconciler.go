@@ -46,6 +46,7 @@ type params struct {
 	Logger                 *slog.Logger
 	Lifecycle              cell.Lifecycle
 	Metrics                *Metrics
+	Health                 cell.Health
 }
 
 type EnrollmentReconciler struct {
@@ -58,6 +59,7 @@ type EnrollmentReconciler struct {
 	cancel                 context.CancelFunc
 	workers                sync.WaitGroup
 	mu                     *semaphore.Weighted
+	initializationHealth   cell.Health
 }
 
 func NewEnrollmentReconciler(cfg params) reconciler.Operations[*table.EnrolledNamespace] {
@@ -71,6 +73,7 @@ func NewEnrollmentReconciler(cfg params) reconciler.Operations[*table.EnrolledNa
 		mu:                     semaphore.NewWeighted(1),
 	}
 	if cfg.SpireClient != nil {
+		ops.initializationHealth = cfg.Health.NewScope("spire-initialization")
 		cfg.Lifecycle.Append(ops)
 	}
 	return ops
@@ -165,10 +168,19 @@ func (ops *EnrollmentReconciler) waitForInitialization(ctx context.Context) erro
 	if err := ops.waitForInventories(ctx); err != nil {
 		return err
 	}
+	initialized := ops.spireClient.Initialized()
+	select {
+	case <-initialized:
+		ops.initializationHealth.OK("SPIRE client initialized")
+		return ctx.Err()
+	default:
+	}
+	ops.initializationHealth.Degraded("Waiting for SPIRE client initialization", fmt.Errorf("SPIRE client is not initialized"))
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-ops.spireClient.Initialized():
+	case <-initialized:
+		ops.initializationHealth.OK("SPIRE client initialized")
 		return ctx.Err()
 	}
 }

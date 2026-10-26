@@ -134,10 +134,12 @@ SPIRE agent authorizes as a delegate. Keeping the Cilium identities preserves
 other consumers of the SPIRE integration.
 
 The controller watches pods, nodes, namespaces and endpoints in the whole
-cluster and keeps one entry per selected pod in each server. It ignores the
-``kube-system``, ``kube-public`` and ``spire-system`` namespaces, so do not
-enroll those namespaces in CRD mode: their pods get no SPIRE entries, and
-ztunnel cannot obtain certificates for them.
+cluster and keeps one entry per selected pod in each server. Controller v0.6.2
+ignores namespaces matching the regular expressions ``kube-system``,
+``kube-public`` and ``spire-system``. These expressions are not anchored:
+``team-kube-system`` also matches. Do not enroll matching namespaces in CRD
+mode: their pods get no SPIRE entries, and ztunnel cannot obtain certificates
+for them.
 
 The controller does not require the ``ClusterFederatedTrustDomain`` CRD. Admission
 webhooks are disabled with ``ENABLE_WEBHOOKS=false``; no webhook resources or
@@ -335,6 +337,15 @@ operation, not a replica-count-only upgrade:
   created; the controller deliberately leaves unprefixed entries alone. Other
   direct-API producers must not rely on writes reaching every independent
   server.
+  Also inspect bootstrap entries left by the legacy ``cilium-init`` script,
+  including ``cilium-agent`` and ``cilium-operator``. An existing entry with
+  the same parent, SPIFFE ID and selectors can conflict with a new bootstrap
+  ``ClusterStaticEntry``. The controller cannot adopt that unprefixed entry;
+  SPIRE returns ``AlreadyExists`` on creation even while the old entry still
+  works. Plan registration migration before changing ownership. Controller
+  v0.6.2 does not publish these failures in ``ClusterStaticEntry`` status, so
+  inspect controller logs and entries on each server. A clean installation
+  does not validate this migration.
 * Enabling CRD registration moves workload identities to the configured
   trust domain. Expect cross-node traffic between enrolled workloads to fail
   until every Cilium agent and ztunnel pod has rolled out.
@@ -360,6 +371,16 @@ checks controller health, not successful reconciliation of every entry.
 Exercise pod loss, node loss, local-store loss, and certificate renewal with
 your cluster's routing and storage behavior. Helm rendering alone cannot prove
 runtime failover.
+
+Disabling CRD registration is also a migration, not a validated rollback
+procedure. More than one bundled server requires ``useCRD=true``. Removing
+the CRs can cause controllers to delete their managed registrations; reverting
+Helm values does not restore registration data. Plan the return to a single
+server, direct-API bootstrap and operator registration, manual ztunnel SPIRE
+wiring, and consistent trust-domain configuration before disabling the flag.
+Preserve the trust root, stores and registration inventory, and validate the
+transition in an isolated environment. Neither node-loss recovery nor a clean
+installation proves that enabling or disabling this mode is uninterrupted.
 
 External SPIRE
 --------------
@@ -426,8 +447,8 @@ This will:
 When ``encryption.ztunnel.spire.useCRD=true``, the chart's ``ClusterSPIFFEID``
 selects namespaces with this label. ``spire-controller-manager`` registers
 each pod in an enrolled namespace and removes those entries when the label is
-removed. Namespaces that the controller ignores, ``kube-system``,
-``kube-public`` and ``spire-system``, cannot be enrolled in this mode.
+removed. Namespaces matching the controller's ignored-namespace regular
+expressions described above cannot be enrolled in this mode.
 
 Validate the Setup
 ==================
