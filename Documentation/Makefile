@@ -95,7 +95,7 @@ $(HELM_VALUES): TMP_FILE_1 := helm-values.tmp
 $(HELM_VALUES): TMP_FILE_2 := helm-values.awk
 $(HELM_VALUES): TMP_FILE_3 := helm-values.sed
 $(HELM_VALUES): FORCE
-	$(QUIET)$(HELM_DOCS) -d -c $(HELM_DOCS_CHARTS_DIR) -t $(HELM_DOCS_OUTPUT_DIR)/$(TMP_FILE_1).tmpl > $(TMP_FILE_1)
+	$(QUIET)$(HELM_DOCS) -d -c $(HELM_DOCS_CHARTS_DIR) -g $(HELM_DOCS_CHARTS_DIR)/cilium -t $(HELM_DOCS_OUTPUT_DIR)/$(TMP_FILE_1).tmpl > $(TMP_FILE_1)
 	$(QUIET)$(DOCKER_AWK) -F'|' '{print "|"$$2"|"$$5"|"$$3"|"$$4"|"}' $(HELM_DOCS_OUTPUT_DIR)/$(TMP_FILE_1) > $(TMP_FILE_2)
 	$(QUIET)$(M2R) --overwrite $(TMP_FILE_2)
 	$(QUIET)$(DOCKER_SED) 's/^\(   \* - \)\([[:print:]]\{1,\}\)$$/\1:spelling:ignore:`\2`/' $(HELM_DOCS_OUTPUT_DIR)/$(HELM_VALUES) > $(TMP_FILE_3)

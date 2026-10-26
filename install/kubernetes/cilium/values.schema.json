@@ -247,6 +247,14 @@
                       },
                       "type": "object"
                     },
+                    "crds": {
+                      "properties": {
+                        "enabled": {
+                          "type": "boolean"
+                        }
+                      },
+                      "type": "object"
+                    },
                     "enabled": {
                       "type": "boolean"
                     },
@@ -307,6 +315,40 @@
                                   "type": "string"
                                 }
                               },
+                              "type": "object"
+                            }
+                          },
+                          "type": "object"
+                        },
+                        "controllerManager": {
+                          "properties": {
+                            "image": {
+                              "properties": {
+                                "digest": {
+                                  "type": "string"
+                                },
+                                "override": {
+                                  "type": [
+                                    "null",
+                                    "string"
+                                  ]
+                                },
+                                "pullPolicy": {
+                                  "type": "string"
+                                },
+                                "repository": {
+                                  "type": "string"
+                                },
+                                "tag": {
+                                  "type": "string"
+                                },
+                                "useDigest": {
+                                  "type": "boolean"
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "resources": {
                               "type": "object"
                             }
                           },
@@ -2113,6 +2155,20 @@
                     "null",
                     "string"
                   ]
+                }
+              },
+              "type": "object"
+            },
+            "spire": {
+              "properties": {
+                "className": {
+                  "type": "string"
+                },
+                "containerRuntimeSocketPath": {
+                  "type": "string"
+                },
+                "useCRD": {
+                  "type": "boolean"
                 }
               },
               "type": "object"
@@ -6511,6 +6567,16 @@
           "type": "boolean"
         }
       },
+      "type": "object"
+    },
+    "spire-crds": {
+      "properties": {
+        "global": {
+          "type": "object"
+        }
+      },
+      "description": "ClusterSPIFFEID and ClusterStaticEntry CRDs for the Cilium SPIRE integration",
+      "title": "spire-crds",
       "type": "object"
     },
     "standaloneDnsProxy": {

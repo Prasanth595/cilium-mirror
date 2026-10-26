@@ -1,0 +1,10 @@
+{{ template "chart.header" . }}
+
+{{ template "chart.description" . }}
+
+{{ template "chart.sourcesSection" . }}
+
+{{ template "chart.requirementsSection" . }}
+
+Helm installs these CRDs only on initial installation. Existing CRDs are not
+adopted or upgraded, and uninstall retains the CRDs and their instances.

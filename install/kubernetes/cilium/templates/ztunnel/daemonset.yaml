@@ -1,4 +1,5 @@
 {{- if and .Values.encryption.enabled (eq .Values.encryption.type "ztunnel") }}
+{{- $managedSPIRE := and (eq .Values.encryption.ztunnel.ca.type "spire") .Values.authentication.mutual.spire.enabled .Values.authentication.mutual.spire.install.enabled .Values.encryption.ztunnel.spire.useCRD }}
 ---
 kind: DaemonSet
 apiVersion: apps/v1
@@ -86,6 +87,19 @@ spec:
                   fieldPath: status.podIP
             - name: ISTIO_META_ENABLE_HBONE
               value: "true"
+            {{- if $managedSPIRE }}
+            - name: SPIRE_ENABLED
+              value: "true"
+            - name: SPIRE_ADMIN_ENDPOINT_SOCKET
+              value: {{ printf "unix://%s" .Values.authentication.mutual.spire.adminSocketPath | quote }}
+            - name: CONTAINER_RUNTIME_SOCK_PATH
+              value: {{ .Values.encryption.ztunnel.spire.containerRuntimeSocketPath | quote }}
+            - name: TRUST_DOMAIN
+              value: {{ .Values.authentication.mutual.spire.trustDomain | quote }}
+            # ztunnel uses CLUSTER_DOMAIN to select the SPIRE trust bundle.
+            - name: CLUSTER_DOMAIN
+              value: {{ .Values.authentication.mutual.spire.trustDomain | quote }}
+            {{- end }}
             {{- with .Values.encryption.ztunnel.extraEnv }}
             {{- toYaml . | trim | nindent 12 }}
             {{- end }}
@@ -127,6 +141,14 @@ spec:
             - mountPath: /etc/ztunnel
               name: cilium-ztunnel-secrets
               readOnly: true
+            {{- if $managedSPIRE }}
+            - name: spire-agent-socket
+              mountPath: {{ dir .Values.authentication.mutual.spire.adminSocketPath }}
+              readOnly: true
+            - name: container-runtime
+              mountPath: {{ .Values.encryption.ztunnel.spire.containerRuntimeSocketPath }}
+              readOnly: true
+            {{- end }}
             {{- with .Values.encryption.ztunnel.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -145,7 +167,7 @@ spec:
       priorityClassName: {{ include "cilium.priorityClass" (list $ .Values.encryption.ztunnel.priorityClassName "system-node-critical") }}
       restartPolicy: Always
       terminationGracePeriodSeconds: {{ .Values.encryption.ztunnel.terminationGracePeriodSeconds }}
-      {{- if .Values.serviceAccounts.ztunnel.create }}
+      {{- if or .Values.serviceAccounts.ztunnel.create $managedSPIRE }}
       serviceAccountName: {{ .Values.serviceAccounts.ztunnel.name | quote }}
       automountServiceAccountToken: {{ .Values.serviceAccounts.ztunnel.automount }}
       {{- else }}
@@ -164,6 +186,16 @@ spec:
               - key: bootstrap-root.crt
                 path: bootstrap-root.crt
                 mode: 420
+        {{- if $managedSPIRE }}
+        - name: spire-agent-socket
+          hostPath:
+            path: {{ dir .Values.authentication.mutual.spire.adminSocketPath }}
+            type: DirectoryOrCreate
+        - name: container-runtime
+          hostPath:
+            path: {{ .Values.encryption.ztunnel.spire.containerRuntimeSocketPath }}
+            type: Socket
+        {{- end }}
         {{- with .Values.encryption.ztunnel.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

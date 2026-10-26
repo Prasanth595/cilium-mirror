@@ -1,4 +1,13 @@
 {{- if and .Values.authentication.mutual.spire.enabled .Values.authentication.mutual.spire.install.enabled -}}
+{{- $useCRD := .Values.encryption.ztunnel.spire.useCRD -}}
+{{- $socketDir := "/run/spire/sockets" -}}
+{{- $workloadSocketDir := "" -}}
+{{- if $useCRD -}}
+{{- $socketDir = dir .Values.authentication.mutual.spire.adminSocketPath -}}
+{{- if not (hasPrefix (printf "%s/" $socketDir) .Values.authentication.mutual.spire.agentSocketPath) -}}
+{{- $workloadSocketDir = dir .Values.authentication.mutual.spire.agentSocketPath -}}
+{{- end -}}
+{{- end }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -28,6 +37,10 @@ spec:
   template:
     metadata:
       namespace: {{ .Values.authentication.mutual.spire.install.namespace }}
+      {{- if $useCRD }}
+      annotations:
+        checksum/spire-agent-config: {{ include (print $.Template.BasePath "/spire/agent/configmap.yaml") . | sha256sum }}
+      {{- end }}
       labels:
         app: spire-agent
         {{- with .Values.commonLabels }}
@@ -79,8 +92,13 @@ spec:
             - name: spire-bundle
               mountPath: /run/spire/bundle
             - name: spire-agent-socket
-              mountPath: /run/spire/sockets
+              mountPath: {{ $socketDir }}
               readOnly: false
+            {{- with $workloadSocketDir }}
+            - name: spire-workload-socket
+              mountPath: {{ . }}
+              readOnly: false
+            {{- end }}
             - name: spire-agent
               mountPath: /var/run/secrets/tokens
           env:
@@ -132,8 +150,14 @@ spec:
             name: spire-bundle
         - name: spire-agent-socket
           hostPath:
-            path: /run/spire/sockets
+            path: {{ $socketDir }}
             type: DirectoryOrCreate
+        {{- with $workloadSocketDir }}
+        - name: spire-workload-socket
+          hostPath:
+            path: {{ . }}
+            type: DirectoryOrCreate
+        {{- end }}
         - name: spire-agent
           projected:
             sources:

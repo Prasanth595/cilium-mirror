@@ -49,6 +49,7 @@ Fosdem
 Freescale
 Fsnotify
 GCP
+GID
 GKE
 Gartrell
 GatewayClass
@@ -267,6 +268,7 @@ cnp
 codebase
 codeowner
 codeowners
+colocated
 commonLabels
 compat
 config
@@ -288,6 +290,7 @@ cpsw
 cpumap
 cqlsh
 crd
+crds
 createtopic
 crio
 cronJob
@@ -348,6 +351,7 @@ edts
 effectful
 egressing
 elfutils
+emptyDir
 ena
 enableDnsCompression
 enableSourceIPVerification
@@ -376,7 +380,9 @@ extern
 externalIPs
 externalTrafficPolicy
 externallyCreated
+extraArgs
 extraConfig
+extraEnv
 extraVolumeMounts
 extraVolumes
 facto
@@ -398,6 +404,7 @@ fromEndpoints
 frontend
 frontends
 fs
+fsGroup
 func
 gRPC
 gVisor
@@ -692,6 +699,7 @@ preconfigured
 preferIpv
 prefilter
 preflight
+preinstall
 preload
 preloaded
 preloading
@@ -762,6 +770,7 @@ roadmap
 rollout
 routable
 routingMode
+runAsNonRoot
 runnable
 runtimes
 sandboxing
@@ -791,6 +800,7 @@ sig
 skb
 snat
 socknat
+spiffeid
 spinlock
 srv
 ssl
@@ -807,6 +817,7 @@ stdout
 stmmac
 strictMode
 structs
+subchart
 subclasses
 subcommand
 subcommands
@@ -894,6 +905,7 @@ unmanaged
 unmarshalled
 unmigrated
 unpaginated
+unprefixed
 unrecognised
 unselect
 unsettable
@@ -908,6 +920,7 @@ uptime
 uretprobes
 url
 urlQuery
+useCRD
 userInfo
 userspace
 uuid

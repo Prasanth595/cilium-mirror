@@ -279,6 +279,26 @@ available during the upgrade:
   events will be lost.
 
 
+SPIRE CRD registration
+----------------------
+
+For a new bundled SPIRE installation, ``encryption.ztunnel.spire.useCRD=true``
+automatically includes the ``ClusterSPIFFEID`` and ``ClusterStaticEntry`` CRDs,
+a ``spire-controller-manager`` sidecar, the ztunnel ``ClusterSPIFFEID``, and
+bootstrap registrations. Existing releases must install the CRDs before
+upgrading because Helm does not install CRDs during upgrades. Set
+``authentication.mutual.spire.install.crds.enabled=false`` to opt out when the
+CRDs are managed externally, including when using external SPIRE.
+
+Enabling ``encryption.ztunnel.spire.useCRD=true`` moves ztunnel workload
+identities to ``authentication.mutual.spire.trustDomain``. Cross-node traffic
+between enrolled workloads can fail until every Cilium agent and ztunnel pod
+has rolled out. Releases that leave this option disabled keep their existing
+ztunnel workload identities and wiring.
+
+See :ref:`ztunnel_spire_installation` for prerequisites, ownership, and
+verification details.
+
 .. _kvstore_to_crd_migration:
 
 Migrating from kvstore-backed identities to Kubernetes CRD-backed identities
