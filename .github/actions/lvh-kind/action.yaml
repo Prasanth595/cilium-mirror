@@ -25,6 +25,22 @@ inputs:
     required: false
     description: 'Package cache key derived once per run by the lvh-cache-key job'
     default: ''
+  auth-required:
+    required: false
+    description: 'Whether Docker in the LVH VM must authenticate to a registry'
+    default: 'false'
+  login-host:
+    required: false
+    description: 'Registry host to authenticate to inside the LVH VM'
+    default: ''
+  login-username:
+    required: false
+    description: 'Username for the registry login inside the LVH VM'
+    default: ''
+  login-password:
+    required: false
+    description: 'Password or token for the registry login inside the LVH VM'
+    default: ''
 
 outputs:
   external_target_name:
@@ -76,6 +92,26 @@ runs:
         cmd: |
           git config --global --add safe.directory /host
 
+    - name: Login to docker registry inside LVH VM
+      id: registry-login
+      if: ${{ inputs.auth-required == 'true' }}
+      shell: bash
+      env:
+        LOGIN_HOST: ${{ inputs.login-host }}
+        LOGIN_USERNAME: ${{ inputs.login-username }}
+        LOGIN_PASSWORD: ${{ inputs.login-password }}
+      run: |
+        set -euo pipefail
+        if [[ -z "$LOGIN_HOST" || -z "$LOGIN_USERNAME" || -z "$LOGIN_PASSWORD" ]]; then
+          echo "::error::Registry authentication requires login-host, login-username, and login-password"
+          exit 1
+        fi
+
+        # Docker commands run as root inside the VM, with a separate credential store.
+        printf -v login_command 'docker login %q --username %q --password-stdin' "$LOGIN_HOST" "$LOGIN_USERNAME"
+        printf '%s\n' "$LOGIN_PASSWORD" |
+          ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes root@localhost "$login_command"
+
     - name: Add external docker network
       uses: ./.github/actions/kind-external-network
       id: external_network
@@ -118,3 +154,14 @@ runs:
         ipv4_other_external_target: ${{ steps.external_network.outputs.ipv4_other_external_target }}
         ipv6_external_target: ${{ steps.external_network.outputs.ipv6_external_target }}
         ipv6_other_external_target: ${{ steps.external_network.outputs.ipv6_other_external_target }}
+
+    - name: Logout from docker registry inside LVH VM
+      if: ${{ always() && inputs.auth-required == 'true' && steps.registry-login.outcome != 'skipped' && inputs.login-host != '' }}
+      shell: bash
+      env:
+        LOGIN_HOST: ${{ inputs.login-host }}
+      run: |
+        # Remove the guest Docker credentials before subsequent test steps run,
+        # including when cluster or external target setup fails.
+        printf -v logout_command 'docker logout %q' "$LOGIN_HOST"
+        ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes root@localhost "$logout_command"
