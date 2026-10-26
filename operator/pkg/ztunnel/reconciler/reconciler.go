@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"iter"
 	"log/slog"
+	"sync"
 
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/statedb"
 	"github.com/cilium/statedb/reconciler"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/cilium/cilium/operator/pkg/ztunnel/spire"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -32,13 +34,7 @@ func requeueNamespace(db *statedb.DB, enrolledTbl statedb.RWTable[*table.Enrolle
 }
 
 // SpireClient is the interface for interacting with SPIRE for enrollment purposes.
-type SpireClient interface {
-	UpsertBatch(ctx context.Context, ids []string) error
-	DeleteBatch(ctx context.Context, ids []string) error
-	Upsert(ctx context.Context, id string) error
-	Delete(ctx context.Context, id string) error
-	Initialized() <-chan struct{}
-}
+type SpireClient = spire.SpireClient
 
 type params struct {
 	cell.In
@@ -46,10 +42,11 @@ type params struct {
 	DB                     *statedb.DB
 	ServiceAccountTable    statedb.Table[ServiceAccount]
 	EnrolledNamespaceTable statedb.RWTable[*table.EnrolledNamespace]
-	SpireClient            *spire.Client
+	SpireClient            spire.SpireClient
 	Logger                 *slog.Logger
 	Lifecycle              cell.Lifecycle
 	Metrics                *Metrics
+	Health                 cell.Health
 }
 
 type EnrollmentReconciler struct {
@@ -60,6 +57,9 @@ type EnrollmentReconciler struct {
 	enrolledNamespaceTable statedb.RWTable[*table.EnrolledNamespace]
 	metrics                *Metrics
 	cancel                 context.CancelFunc
+	workers                sync.WaitGroup
+	mu                     *semaphore.Weighted
+	initializationHealth   cell.Health
 }
 
 func NewEnrollmentReconciler(cfg params) reconciler.Operations[*table.EnrolledNamespace] {
@@ -70,14 +70,28 @@ func NewEnrollmentReconciler(cfg params) reconciler.Operations[*table.EnrolledNa
 		serviceAccountTable:    cfg.ServiceAccountTable,
 		enrolledNamespaceTable: cfg.EnrolledNamespaceTable,
 		metrics:                cfg.Metrics,
+		mu:                     semaphore.NewWeighted(1),
 	}
 	if cfg.SpireClient != nil {
+		ops.initializationHealth = cfg.Health.NewScope("spire-initialization")
 		cfg.Lifecycle.Append(ops)
 	}
 	return ops
 }
 
-func (ops *EnrollmentReconciler) Delete(ctx context.Context, txn statedb.ReadTxn, rev statedb.Revision, ns *table.EnrolledNamespace) error {
+func (ops *EnrollmentReconciler) Delete(ctx context.Context, _ statedb.ReadTxn, rev statedb.Revision, ns *table.EnrolledNamespace) error {
+	if err := ops.waitForInitialization(ctx); err != nil {
+		return err
+	}
+	if err := ops.mu.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer ops.mu.Release(1)
+	txn := ops.db.ReadTxn()
+	if _, _, enrolled := ops.enrolledNamespaceTable.Get(txn, table.EnrolledNamespaceByName(ns.Name)); enrolled {
+		// An old deletion may be retried after this namespace was reenrolled.
+		return nil
+	}
 	// Namespace was enrolled, remove all service accounts in the namespace from the CA.
 	sas := ops.serviceAccountTable.List(txn, ServiceAccountNamespaceIndex.Query(ns.Name))
 	ids := []string{}
@@ -108,7 +122,18 @@ func (ops *EnrollmentReconciler) Prune(ctx context.Context, txn statedb.ReadTxn,
 	return nil
 }
 
-func (ops *EnrollmentReconciler) Update(ctx context.Context, txn statedb.ReadTxn, rev statedb.Revision, ns *table.EnrolledNamespace) error {
+func (ops *EnrollmentReconciler) Update(ctx context.Context, _ statedb.ReadTxn, rev statedb.Revision, ns *table.EnrolledNamespace) error {
+	if err := ops.waitForInitialization(ctx); err != nil {
+		return err
+	}
+	if err := ops.mu.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer ops.mu.Release(1)
+	txn := ops.db.ReadTxn()
+	if _, _, enrolled := ops.enrolledNamespaceTable.Get(txn, table.EnrolledNamespaceByName(ns.Name)); !enrolled {
+		return nil
+	}
 	ops.logger.Debug("Reconciling namespace", logfields.K8sNamespace, ns.Name)
 
 	// Namespace is enrolled, ensure all service accounts in the namespace are
@@ -139,29 +164,88 @@ func (ops *EnrollmentReconciler) Update(ctx context.Context, txn statedb.ReadTxn
 
 var _ reconciler.Operations[*table.EnrolledNamespace] = &EnrollmentReconciler{}
 
+func (ops *EnrollmentReconciler) waitForInitialization(ctx context.Context) error {
+	if err := ops.waitForInventories(ctx); err != nil {
+		return err
+	}
+	initialized := ops.spireClient.Initialized()
+	select {
+	case <-initialized:
+		ops.initializationHealth.OK("SPIRE client initialized")
+		return ctx.Err()
+	default:
+	}
+	ops.initializationHealth.Degraded("Waiting for SPIRE client initialization", fmt.Errorf("SPIRE client is not initialized"))
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-initialized:
+		ops.initializationHealth.OK("SPIRE client initialized")
+		return ctx.Err()
+	}
+}
+
+func (ops *EnrollmentReconciler) waitForInventories(ctx context.Context) error {
+	if ops.spireClient == nil {
+		return fmt.Errorf("SPIRE registration client is disabled")
+	}
+	txn := ops.db.ReadTxn()
+	_, saInit := ops.serviceAccountTable.Initialized(txn)
+	_, nsInit := ops.enrolledNamespaceTable.Initialized(txn)
+	for _, initialized := range []<-chan struct{}{saInit, nsInit} {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-initialized:
+		}
+	}
+	return ctx.Err()
+}
+
+func (ops *EnrollmentReconciler) reconcileServiceAccount(ctx context.Context, sa ServiceAccount) {
+	if err := ops.mu.Acquire(ctx, 1); err != nil {
+		ops.logger.Debug("ServiceAccount reconciliation canceled", logfields.Error, err)
+		return
+	}
+	defer ops.mu.Release(1)
+
+	id := sa.Namespace + "/" + sa.Name
+	txn := ops.db.ReadTxn()
+	_, _, exists := ops.serviceAccountTable.Get(txn, ServiceAccountNamespacedNameIndex.Query(id))
+	var err error
+	method := LabelValueMethodDelete
+	if exists {
+		_, _, enrolled := ops.enrolledNamespaceTable.Get(txn, table.EnrolledNamespaceByName(sa.Namespace))
+		if !enrolled {
+			return
+		}
+		// Consult current state instead of replaying a stale deletion for a
+		// same-name ServiceAccount that has since been recreated.
+		method = LabelValueMethodUpsert
+		err = ops.spireClient.Upsert(ctx, id)
+	} else {
+		err = ops.spireClient.Delete(ctx, id)
+	}
+	if err != nil {
+		ops.logger.Error("Failed to reconcile ServiceAccount registration",
+			logfields.Error, err,
+			logfields.Identity, id)
+		ops.metrics.EnrollmentOps.WithLabelValues(method, LabelValueOutcomeFail).Inc()
+		requeueNamespace(ops.db, ops.enrolledNamespaceTable, sa.Namespace)
+	} else {
+		ops.metrics.EnrollmentOps.WithLabelValues(method, LabelValueOutcomeSuccess).Inc()
+	}
+}
+
 func (ops *EnrollmentReconciler) Start(cell.HookContext) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	ops.cancel = cancel
-
-	go func() {
+	ops.workers.Go(func() {
 		ops.logger.Info("Starting mTLS enrollment reconciler")
 
-		// Wait for tables to initialize before processing changes.
-		_, saInit := ops.serviceAccountTable.Initialized(ops.db.ReadTxn())
-		select {
-		case <-ctx.Done():
+		if err := ops.waitForInventories(ctx); err != nil {
 			return
-		case <-saInit:
 		}
-		ops.logger.Info("ServiceAccount table initialized")
-
-		_, nsInit := ops.enrolledNamespaceTable.Initialized(ops.db.ReadTxn())
-		select {
-		case <-ctx.Done():
-			return
-		case <-nsInit:
-		}
-		ops.logger.Info("EnrolledNamespace table initialized")
 
 		wtxn := ops.db.WriteTxn(ops.serviceAccountTable)
 		changeIterator, err := ops.serviceAccountTable.Changes(wtxn)
@@ -171,49 +255,15 @@ func (ops *EnrollmentReconciler) Start(cell.HookContext) error {
 			return
 		}
 
-		// Wait for SPIRE client to initialize.
-		select {
-		case <-ctx.Done():
+		// Retain deletions that happen while the SPIRE connection initializes.
+		if err := ops.waitForInitialization(ctx); err != nil {
 			return
-		case <-ops.spireClient.Initialized():
 		}
-		ops.logger.Info("SPIRE client initialized")
 
 		for {
 			changes, watch := changeIterator.Next(ops.db.ReadTxn())
 			for change := range changes {
-				sa := change.Object
-				id := fmt.Sprintf("%s/%s", sa.Namespace, sa.Name)
-				if change.Deleted {
-					ops.logger.Debug("ServiceAccount deleted", logfields.Name, sa.Name)
-					if err := ops.spireClient.Delete(ctx, id); err != nil {
-						ops.logger.Error("failed to delete CA entry",
-							logfields.Error, err.Error(),
-							logfields.Identity, id)
-						ops.metrics.EnrollmentOps.WithLabelValues(LabelValueMethodDelete, LabelValueOutcomeFail).Inc()
-						requeueNamespace(ops.db, ops.enrolledNamespaceTable, sa.Namespace)
-					} else {
-						ops.logger.Info("CA entry deleted", logfields.Identity, id)
-						ops.metrics.EnrollmentOps.WithLabelValues(LabelValueMethodDelete, LabelValueOutcomeSuccess).Inc()
-					}
-				} else {
-					ops.logger.Debug("ServiceAccount added/updated", logfields.Name, sa.Name)
-					_, _, found := ops.enrolledNamespaceTable.Get(ops.db.ReadTxn(), table.EnrolledNamespaceByName(sa.Namespace))
-					if !found {
-						ops.logger.Debug("Namespace not enrolled for mTLS", logfields.K8sNamespace, sa.Namespace)
-						continue
-					}
-					if err := ops.spireClient.Upsert(ctx, id); err != nil {
-						ops.logger.Error("failed to upsert CA entry",
-							logfields.Error, err.Error(),
-							logfields.Identity, id)
-						ops.metrics.EnrollmentOps.WithLabelValues(LabelValueMethodUpsert, LabelValueOutcomeFail).Inc()
-						requeueNamespace(ops.db, ops.enrolledNamespaceTable, sa.Namespace)
-					} else {
-						ops.logger.Info("CA entry upserted", logfields.Identity, id)
-						ops.metrics.EnrollmentOps.WithLabelValues(LabelValueMethodUpsert, LabelValueOutcomeSuccess).Inc()
-					}
-				}
+				ops.reconcileServiceAccount(ctx, change.Object)
 			}
 			select {
 			case <-ctx.Done():
@@ -221,13 +271,14 @@ func (ops *EnrollmentReconciler) Start(cell.HookContext) error {
 			case <-watch:
 			}
 		}
-	}()
+	})
 	return nil
 }
 
 func (ops *EnrollmentReconciler) Stop(cell.HookContext) error {
 	if ops.cancel != nil {
 		ops.cancel()
+		ops.workers.Wait()
 	}
 	ops.logger.Info("Stopping reconciler")
 	return nil

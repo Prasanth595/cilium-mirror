@@ -143,6 +143,97 @@
 {{- end }}
 
 {{/* validate Cilium operator */}}
+{{- range .Values.operator.extraArgs }}
+  {{- if regexMatch "^--enable-ztunnel-spiffeid-crd($|=)" . }}
+    {{ fail "Remove --enable-ztunnel-spiffeid-crd from operator.extraArgs and use encryption.ztunnel.spire.useCRD instead." }}
+  {{- end }}
+{{- end }}
+{{- if .Values.encryption.ztunnel.spire.useCRD }}
+  {{- if not (and .Values.encryption.enabled (eq .Values.encryption.type "ztunnel") (eq .Values.encryption.ztunnel.ca.type "spire") .Values.authentication.mutual.spire.enabled) }}
+    {{ fail "encryption.ztunnel.spire.useCRD=true requires encryption.enabled=true, encryption.type=ztunnel, encryption.ztunnel.ca.type=spire and authentication.mutual.spire.enabled=true." }}
+  {{- end }}
+  {{- $installCRDs := true }}
+  {{- if hasKey .Values.authentication.mutual.spire.install.crds "enabled" }}
+    {{- $installCRDs = .Values.authentication.mutual.spire.install.crds.enabled }}
+  {{- end }}
+  {{- $kinds := list "ClusterSPIFFEID" }}
+  {{- if .Values.authentication.mutual.spire.install.enabled }}
+    {{- $kinds = append $kinds "ClusterStaticEntry" }}
+  {{- end }}
+  {{- range $kind := $kinds }}
+    {{- if not ($.Capabilities.APIVersions.Has (printf "spire.spiffe.io/v1alpha1/%s" $kind)) }}
+      {{- if $.Release.IsUpgrade }}
+        {{ fail (printf "Install the bundled spire-crds chart before upgrading an existing release to CRD-managed SPIRE; the %s CRD is missing. Helm does not install CRDs during upgrades." $kind) }}
+      {{- else if not $installCRDs }}
+        {{ fail (printf "CRD-managed SPIRE requires the %s CRD. Remove the install.crds.enabled=false override to install the bundled CRDs; for an existing CRD, offline rendering requires --api-versions spire.spiffe.io/v1alpha1/%s." $kind $kind) }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+
+{{/* validate chart-managed SPIRE */}}
+{{- if and .Values.authentication.mutual.spire.enabled .Values.authentication.mutual.spire.install.enabled }}
+  {{- $server := .Values.authentication.mutual.spire.install.server }}
+  {{- if or (kindIs "string" $server.replicas) (not (regexMatch "^[1-9][0-9]*$" (toString $server.replicas))) (gt (int64 $server.replicas) 2147483647) }}
+    {{ fail "authentication.mutual.spire.install.server.replicas must be an integer between 1 and 2147483647." }}
+  {{- end }}
+  {{- if gt (int64 $server.replicas) 1 }}
+    {{- if not .Values.encryption.ztunnel.spire.useCRD }}
+      {{ fail "Multiple SPIRE servers require encryption.ztunnel.spire.useCRD=true; independent SQLite servers cannot share Entry API registration state." }}
+    {{- end }}
+    {{- if ne $server.service.type "ClusterIP" }}
+      {{ fail "Multiple SPIRE servers require authentication.mutual.spire.install.server.service.type=ClusterIP for ClientIP affinity." }}
+    {{- end }}
+    {{- if .Values.authentication.mutual.spire.serverAddress }}
+      {{ fail "Multiple chart-managed SPIRE servers require the chart's spire-server Service; leave authentication.mutual.spire.serverAddress unset." }}
+    {{- end }}
+  {{- end }}
+  {{- if and .Release.IsUpgrade (not $server.ca.upstreamSecret) }}
+    {{- $existing := lookup "apps/v1" "StatefulSet" .Values.authentication.mutual.spire.install.namespace "spire-server" }}
+    {{- if $existing }}
+      {{- $previousRoot := "" }}
+      {{- range $existing.spec.template.spec.volumes }}
+        {{- if eq .name "spire-upstream-ca" }}
+          {{- $previousRoot = .secret.secretName }}
+        {{- end }}
+      {{- end }}
+      {{- if ne $previousRoot (include "cilium.spire.upstreamSecret" .) }}
+        {{ fail "Changing the automatic SPIRE upstream root during an upgrade requires a planned trust migration. Set authentication.mutual.spire.install.server.ca.upstreamSecret explicitly; retain the existing shared root name when scaling down to one persistent server." }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+  {{- if .Values.encryption.ztunnel.spire.useCRD }}
+    {{- range $name, $path := dict "agentSocketPath" .Values.authentication.mutual.spire.agentSocketPath "adminSocketPath" .Values.authentication.mutual.spire.adminSocketPath }}
+      {{- if or (not (hasPrefix "/" $path)) (ne (clean $path) $path) (hasSuffix "/" $path) (eq (dir $path) "/") }}
+        {{ fail (printf "authentication.mutual.spire.%s must be a clean absolute socket path in a non-root directory." $name) }}
+      {{- end }}
+    {{- end }}
+    {{- if eq .Values.authentication.mutual.spire.agentSocketPath .Values.authentication.mutual.spire.adminSocketPath }}
+      {{ fail "authentication.mutual.spire.agentSocketPath and adminSocketPath must be different." }}
+    {{- end }}
+    {{- $path := .Values.encryption.ztunnel.spire.containerRuntimeSocketPath }}
+    {{- if or (not (hasPrefix "/" $path)) (ne (clean $path) $path) (hasSuffix "/" $path) (eq (dir $path) "/") }}
+      {{ fail "encryption.ztunnel.spire.containerRuntimeSocketPath must be a clean absolute socket path in a non-root directory." }}
+    {{- end }}
+    {{- range .Values.encryption.ztunnel.extraEnv }}
+      {{- if has .name (list "SPIRE_ENABLED" "SPIRE_ADMIN_ENDPOINT_SOCKET" "CONTAINER_RUNTIME_SOCK_PATH" "TRUST_DOMAIN" "CLUSTER_DOMAIN") }}
+        {{ fail (printf "Remove %s from encryption.ztunnel.extraEnv; chart-managed SPIRE supplies it from the SPIRE Helm values." .name) }}
+      {{- end }}
+    {{- end }}
+    {{- range concat .Values.encryption.ztunnel.extraVolumes .Values.encryption.ztunnel.extraVolumeMounts }}
+      {{- if has .name (list "spire-agent-socket" "container-runtime") }}
+        {{ fail (printf "Remove the %s extra volume or volumeMount; chart-managed SPIRE supplies it." .name) }}
+      {{- end }}
+    {{- end }}
+    {{- $socketDirectory := dir .Values.authentication.mutual.spire.adminSocketPath }}
+    {{- range .Values.encryption.ztunnel.extraVolumeMounts }}
+      {{- if has .mountPath (list $socketDirectory $path) }}
+        {{ fail (printf "Remove the extra volumeMount at mountPath %s; chart-managed SPIRE supplies it." .mountPath) }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+
 {{- if .Values.ciliumEndpointSlice.enabled }}
   {{- if eq .Values.disableEndpointCRD true }}
     {{ fail "if Cilium Endpoint Slice is enabled (.Values.ciliumEndpointSlice.enabled=true), it requires .Values.disableEndpointCRD=false" }}

@@ -1,4 +1,8 @@
 {{- if and .Values.authentication.mutual.spire.enabled .Values.authentication.mutual.spire.install.enabled (not .Values.authentication.mutual.spire.install.existingNamespace) -}}
+{{- $annotations := .Values.authentication.mutual.spire.annotations -}}
+{{- if include "cilium.spire.upstreamSecret" . -}}
+{{- $annotations = set (deepCopy ($annotations | default dict)) "helm.sh/resource-policy" "keep" -}}
+{{- end -}}
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -7,7 +11,7 @@ metadata:
   labels:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-  {{- with .Values.authentication.mutual.spire.annotations }}
+  {{- with $annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}

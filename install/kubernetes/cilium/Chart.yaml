@@ -5,6 +5,10 @@ home: https://cilium.io/
 version: 1.21.0-dev
 appVersion: 1.21.0-dev
 kubeVersion: ">= 1.21.0-0"
+dependencies:
+  - name: spire-crds
+    version: 0.6.2
+    condition: authentication.mutual.spire.install.crds.enabled,encryption.ztunnel.spire.useCRD
 icon: https://cdn.jsdelivr.net/gh/cilium/cilium@main/Documentation/images/logo-solo.svg
 description: eBPF-based Networking, Security, and Observability
 keywords:

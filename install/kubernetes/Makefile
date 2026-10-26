@@ -20,7 +20,7 @@ CHART_FILE := "$(CILIUM_CHARTS)/Chart.yaml"
 VALUES_TMPL_FILE_NAME ?= *values.yaml.tmpl
 
 VERSION_REGEX := '[0-9]\+\.[0-9]\+\.[0-9]\+.*'
-CILIUM_CHART_REGEX := '\([vV]ersion:\) '$(VERSION_REGEX)
+CILIUM_CHART_REGEX := '^\(\(appV\|v\)ersion:\) '$(VERSION_REGEX)
 
 DOCKER_RUN := $(CONTAINER_ENGINE) container run --rm \
 	--workdir /src/install/kubernetes \
@@ -51,8 +51,7 @@ all: update-versions check-values-yaml docs lint
 
 update-chart: $(ROOT_DIR)/VERSION # Update chart versions to point to the current version.
 	$(ECHO_GEN)cilium/Chart.yaml
-	$(QUIET)grep -lR -e 'version:' -e 'appVersion:' $(CILIUM_CHARTS)/ \
-		| xargs -L 1 $(SED) -i -e 's/'$(CILIUM_CHART_REGEX)'/\1 '$(VERSION)'/g'
+	$(QUIET)$(SED) -i -e 's/'$(CILIUM_CHART_REGEX)'/\1 '$(VERSION)'/g' $(CHART_FILE)
 	$(QUIET)$(SED) -i 's;icon:.*;icon: $(LOGO_BASE_URL)/cilium@main/$(LOGO_PATH);' $(CHART_FILE)
 
 check-values-yaml: cilium/values.schema.json

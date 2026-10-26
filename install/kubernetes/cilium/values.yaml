@@ -1203,10 +1203,46 @@ encryption:
       # @schema
       # enum: [spire, internal]
       # @schema
-      # -- Type of CA. "spire" uses an external SPIRE server (the operator
-      # then manages SPIRE entries for enrolled namespaces). "internal" uses
+      # -- Type of CA. "spire" uses a SPIRE server (the operator then manages
+      # SPIRE entries for enrolled namespaces, unless encryption.ztunnel.spire.useCRD=true
+      # registers them with a ClusterSPIFFEID). "internal" uses
       # Cilium's built-in CA and skips the SPIRE enrollment reconciler.
       type: internal
+    spire:
+      # -- Register ztunnel workload identities with a ClusterSPIFFEID that
+      # spire-controller-manager reconciles, instead of the operator writing
+      # entries through the SPIRE Entry API. Every pod in a namespace labeled
+      # `io.cilium/mtls-enabled=true` gets the SPIFFE ID
+      # `spiffe://<trust domain>/ns/<namespace>/sa/<service account>`, and the
+      # agent advertises `authentication.mutual.spire.trustDomain` to ztunnel.
+      # Enabling this changes workload identities to that trust domain, so
+      # cross-node traffic can fail until all agents and ztunnel pods have rolled out.
+      # Requires `encryption.enabled=true`, `encryption.type=ztunnel`,
+      # `encryption.ztunnel.ca.type=spire` and `authentication.mutual.spire.enabled=true`.
+      # SPIRE may be chart-managed or external (`authentication.mutual.spire.install.enabled=false`).
+      # Chart-managed SPIRE adds a controller-manager to each SPIRE server,
+      # bootstrap ClusterStaticEntries, and the ztunnel SPIRE wiring.
+      # External SPIRE requires its own spire-controller-manager reconciling
+      # ClusterSPIFFEIDs of `encryption.ztunnel.spire.className`, and its own ztunnel wiring.
+      # The bundled CRDs are installed automatically on a new release unless
+      # `authentication.mutual.spire.install.crds.enabled=false`.
+      # Existing releases must preinstall the CRDs before upgrading.
+      # Remove `--enable-ztunnel-spiffeid-crd` from `operator.extraArgs` and use this value instead.
+      # If the SPIRE server ServiceAccount or RBAC is managed outside this chart,
+      # grant the controller-manager permissions outside this chart as well.
+      useCRD: false
+      # -- spire-controller-manager class name of the ztunnel ClusterSPIFFEID and
+      # the chart-managed bootstrap ClusterStaticEntries. The chart-managed
+      # controller-manager only reconciles resources of this class, or only
+      # resources without a class when empty. With external SPIRE, set the class
+      # that its controller-manager reconciles, or "" for a controller-manager
+      # without a class name. Only used with useCRD=true.
+      className: cilium-spire
+      # -- Node-local containerd CRI socket used by ztunnel for delegated PID
+      # attestation with chart-managed SPIRE and useCRD=true. Mounted read-only into ztunnel;
+      # access to this socket still grants privileged container-runtime access.
+      # External SPIRE installations retain their own extraEnv/volume wiring.
+      containerRuntimeSocketPath: /run/containerd/containerd.sock
     # -- ztunnel container image.
     image:
       # @schema
@@ -4438,7 +4474,25 @@ authentication:
         # -- SPIRE namespace to install into
         namespace: cilium-spire
         # -- SPIRE namespace already exists. Set to true if Helm should not create, manage, and import the SPIRE namespace.
+        # A chart-managed namespace is retained when an upstream root Secret is
+        # selected, including the automatic shared root, so uninstall does not
+        # indirectly delete it.
         existingNamespace: false
+        # @schema
+        # type: object
+        # properties:
+        #   enabled:
+        #     type: boolean
+        # @schema
+        # -- Bundled ClusterSPIFFEID and ClusterStaticEntry CRD installation. By
+        # default this follows `encryption.ztunnel.spire.useCRD`, including with
+        # external SPIRE. Set enabled=false to opt out for externally managed
+        # CRDs, or enabled=true to install them explicitly. Helm skips
+        # existing CRDs without adopting or updating them and does not upgrade
+        # or delete CRDs. Existing releases must preinstall the CRDs before
+        # enabling CRD mode.
+        # Omit enabled so Helm can use its fallback dependency condition.
+        crds: {}
         # -- init container image of SPIRE agent and server
         initImage:
           # @schema
@@ -4507,6 +4561,17 @@ authentication:
           # ref: https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-container
           securityContext: {}
         server:
+          # @schema
+          # type: integer
+          # minimum: 1
+          # maximum: 2147483647
+          # @schema
+          # -- Number of SPIRE server/controller pairs, not database replicas.
+          # More than one requires encryption.ztunnel.spire.useCRD=true,
+          # a ClusterIP Service, and an existing shared root Secret. Each server
+          # uses its own PVC by default. The shared root defaults to the
+          # spire-upstream-ca Secret; ca.upstreamSecret overrides its name.
+          replicas: 1
           # -- The priority class to use for the spire server
           priorityClassName: ""
           # -- SPIRE server image
@@ -4533,6 +4598,25 @@ authentication:
           # SPIRE server service configuration
           # -- container resource limits & requests
           resources: {}
+          # Settings for the sidecar installed when encryption.ztunnel.spire.useCRD=true.
+          # Each controller reconciles the ztunnel ClusterSPIFFEID and the
+          # bootstrap ClusterStaticEntries into its pod-local server. It skips
+          # pods in the kube-system, kube-public and spire-system namespaces.
+          controllerManager:
+            # -- SPIRE controller-manager image. Keep the bundled CRDs compatible
+            # when overriding this image.
+            image:
+              # @schema
+              # type: [null, string]
+              # @schema
+              override: ~
+              repository: "ghcr.io/spiffe/spire-controller-manager"
+              tag: "0.6.2"
+              digest: "sha256:b04ddb8e9b89298cc0105f1939fb5b1e4f1ae87e2da20604e5990659e96c717b"
+              useDigest: true
+              pullPolicy: "Always"
+            # -- SPIRE controller-manager container resource limits and requests.
+            resources: {}
           service:
             # -- Service type for the SPIRE server service
             type: ClusterIP
@@ -4540,7 +4624,9 @@ authentication:
             annotations: {}
             # -- Labels to be added to the SPIRE server service
             labels: {}
-          # -- SPIRE server affinity configuration
+          # -- SPIRE server affinity configuration. With multiple replicas and no
+          # explicit affinity, require separate nodes using kubernetes.io/hostname.
+          # Overriding this may remove protection against a node failure.
           affinity: {}
           # -- SPIRE server nodeSelector configuration
           # ref: ref: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector
@@ -4550,7 +4636,11 @@ authentication:
           tolerations: []
           # SPIRE server datastorage configuration
           dataStorage:
-            # -- Enable SPIRE server data storage
+            # -- Enable a separate PVC for every SPIRE server, including multiple
+            # replicas. These independent SQLite stores do not replicate SQL.
+            # Set false for advanced disposable storage. CRD mode then uses
+            # pod-local emptyDir storage and an existing shared root, even with
+            # one replica. Changing this setting requires StatefulSet recreation.
             enabled: true
             # -- Size of the SPIRE server data storage
             size: 1Gi
@@ -4562,15 +4652,33 @@ authentication:
             # -- StorageClass of the SPIRE server data storage
             storageClass: null
           # -- Security context to be added to spire server pods.
+          # CRD-managed servers default to UID/GID/fsGroup 1000 and runAsNonRoot=true;
+          # legacy servers using an upstream root also default to fsGroup 1000.
+          # These values override those defaults.
           # SecurityContext holds pod-level security attributes and common container settings.
           # ref: https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-pod
           podSecurityContext: {}
-          # -- Security context to be added to spire server containers.
+          # -- Security context to be added to spire server containers and the
+          # controller-manager, so both can access the private API socket.
           # SecurityContext holds pod-level security attributes and common container settings.
           # ref: https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-container
           securityContext: {}
           # SPIRE CA configuration
           ca:
+            # @schema
+            # type: string
+            # maxLength: 253
+            # pattern: '^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+            # @schema
+            # -- Override the existing upstream root Secret in the SPIRE namespace,
+            # containing a self-signed root CA certificate (tls.crt) and its
+            # private key (tls.key). Empty selects spire-upstream-ca for multiple
+            # servers or disposable CRD-managed storage; a persistent single
+            # server keeps its own CA unless this override is set. Pin the
+            # existing shared root name when scaling back to one persistent server.
+            # The chart only mounts this Secret; it never generates, reads, rotates
+            # or deletes CA material. Changing roots requires a planned migration.
+            upstreamSecret: ""
             # -- SPIRE CA key type
             # AWS requires the use of RSA. EC cryptography is not supported
             keyType: "rsa-4096"

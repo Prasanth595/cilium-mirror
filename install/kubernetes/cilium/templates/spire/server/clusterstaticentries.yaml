@@ -1,0 +1,40 @@
+{{- if and .Values.authentication.mutual.spire.enabled .Values.authentication.mutual.spire.install.enabled .Values.encryption.ztunnel.spire.useCRD -}}
+{{- $trustDomain := .Values.authentication.mutual.spire.trustDomain -}}
+{{- $agentID := printf "spiffe://%s/ns/%s/sa/%s" $trustDomain .Values.authentication.mutual.spire.install.namespace .Values.authentication.mutual.spire.install.agent.serviceAccount.name -}}
+{{- $entries := list
+  (dict "name" "agent" "spiffeID" $agentID "parentID" (printf "spiffe://%s/spire/server" $trustDomain) "selectors" (list
+    (printf "k8s_psat:cluster:%s" .Values.cluster.name)
+    (printf "k8s_psat:agent_ns:%s" .Values.authentication.mutual.spire.install.namespace)
+    (printf "k8s_psat:agent_sa:%s" .Values.authentication.mutual.spire.install.agent.serviceAccount.name)))
+  (dict "name" "cilium-agent" "spiffeID" (printf "spiffe://%s/cilium-agent" $trustDomain) "parentID" $agentID "selectors" (list
+    (printf "k8s:ns:%s" (include "cilium.namespace" .))
+    (printf "k8s:sa:%s" .Values.serviceAccounts.cilium.name)))
+  (dict "name" "cilium-operator" "spiffeID" (printf "spiffe://%s/cilium-operator" $trustDomain) "parentID" $agentID "selectors" (list
+    (printf "k8s:ns:%s" (include "cilium.namespace" .))
+    (printf "k8s:sa:%s" .Values.serviceAccounts.operator.name)))
+  (dict "name" "ztunnel" "spiffeID" (printf "spiffe://%s/ztunnel" $trustDomain) "parentID" $agentID "selectors" (list
+    (printf "k8s:ns:%s" (include "cilium.namespace" .))
+    (printf "k8s:sa:%s" .Values.serviceAccounts.ztunnel.name)))
+-}}
+{{- range $entry := $entries }}
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterStaticEntry
+metadata:
+  name: {{ printf "cilium-spire-%s-%s-%s" (include "cilium.namespace" $) $.Release.Name $entry.name }}
+  labels:
+    {{- merge (dict "app.kubernetes.io/managed-by" $.Release.Service) $.Values.commonLabels | toYaml | nindent 4 }}
+  {{- with $.Values.authentication.mutual.spire.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with $.Values.encryption.ztunnel.spire.className }}
+  className: {{ . | quote }}
+  {{- end }}
+  spiffeID: {{ $entry.spiffeID | quote }}
+  parentID: {{ $entry.parentID | quote }}
+  selectors:
+    {{- toYaml $entry.selectors | nindent 4 }}
+{{- end }}
+{{- end }}
