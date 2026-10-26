@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/cilium/hive/cell"
-	"github.com/spf13/pflag"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
@@ -23,85 +22,15 @@ import (
 	"google.golang.org/grpc/credentials"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	ztunnel "github.com/cilium/cilium/operator/pkg/ztunnel/config"
 	"github.com/cilium/cilium/pkg/backoff"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
-const (
-	notFoundError = "NotFound"
-	parentID      = "/ztunnel"
-)
+const notFoundError = "NotFound"
 
-// DefaultSpireEntryConfig returns the ztunnel SPIRE entry configuration.
-func DefaultSpireEntryConfig() SpireEntryConfig {
-	return SpireEntryConfig{
-		ParentID:      parentID,
-		PathFunc:      ztunnel.SpiffeIDPathFunc,
-		SelectorsFunc: ztunnel.SpiffeIDSelectorsFunc,
-	}
-}
-
-// Cell is the cell for the SPIRE client.
-var Cell = cell.Module(
-	"spire-client",
-	"Spire Server API Client",
-	cell.Config(defaultClientConfig),
-	cell.Provide(DefaultSpireEntryConfig),
-	cell.Provide(NewEntryClient),
-)
-
-// ClientConfig contains the configuration for the SPIRE client.
-type ClientConfig struct {
-	SpireAgentSocketPath         string        `mapstructure:"mesh-auth-spire-agent-socket"`
-	SpireServerAddress           string        `mapstructure:"mesh-auth-spire-server-address"`
-	SpireServerConnectionTimeout time.Duration `mapstructure:"mesh-auth-spire-server-connection-timeout"`
-	SpiffeTrustDomain            string        `mapstructure:"mesh-auth-spiffe-trust-domain"`
-}
-
-var defaultClientConfig = ClientConfig{
-	SpireAgentSocketPath:         "/run/spire/sockets/agent/agent.sock",
-	SpireServerAddress:           "spire-server.spire.svc:8081",
-	SpireServerConnectionTimeout: 10 * time.Second,
-	SpiffeTrustDomain:            "spiffe.cilium",
-}
-
-// Flags adds the flags used by ClientConfig.
-func (cfg ClientConfig) Flags(flags *pflag.FlagSet) {
-	flags.String("mesh-auth-spire-agent-socket",
-		cfg.SpireAgentSocketPath,
-		"The path for the SPIRE admin agent Unix socket.")
-	flags.String("mesh-auth-spire-server-address",
-		cfg.SpireServerAddress,
-		"SPIRE server endpoint.")
-	flags.Duration("mesh-auth-spire-server-connection-timeout",
-		cfg.SpireServerConnectionTimeout,
-		"SPIRE server connection timeout.")
-	flags.String("mesh-auth-spiffe-trust-domain",
-		cfg.SpiffeTrustDomain,
-		"The trust domain for the SPIFFE identity.")
-}
-
-type params struct {
-	cell.In
-
-	Logger        *slog.Logger
-	K8sClient     k8sClient.Clientset
-	Lifecycle     cell.Lifecycle
-	ClientConfig  ClientConfig
-	EntryConfig   SpireEntryConfig
-	ZtunnelConfig ztunnel.Config
-}
-
-// SpireEntryConfig contains the configuration for ztunnel SPIRE entry generation.
-type SpireEntryConfig struct {
-	ParentID      string
-	PathFunc      func(string) string
-	SelectorsFunc func(string) []*types.Selector
-}
-
+// EntryClient registers identities through the SPIRE Entry API.
 type EntryClient struct {
 	cfg         ClientConfig
 	log         *slog.Logger
@@ -112,12 +41,9 @@ type EntryClient struct {
 	initialized chan struct{}
 }
 
-// NewEntryClient creates a new SPIRE client for ztunnel namespace enrollment.
-func NewEntryClient(params params) *EntryClient {
-	if !params.ZtunnelConfig.UseSpireCA() {
-		return nil
-	}
+var _ SpireClient = (*EntryClient)(nil)
 
+func newEntryClient(params params) *EntryClient {
 	client := &EntryClient{
 		k8sClient:   params.K8sClient,
 		cfg:         params.ClientConfig,
@@ -225,19 +151,7 @@ func (c *EntryClient) Upsert(ctx context.Context, id string) error {
 		return err
 	}
 
-	desired := []*types.Entry{
-		{
-			SpiffeId: &types.SPIFFEID{
-				TrustDomain: c.cfg.SpiffeTrustDomain,
-				Path:        c.entryCfg.PathFunc(id),
-			},
-			ParentId: &types.SPIFFEID{
-				TrustDomain: c.cfg.SpiffeTrustDomain,
-				Path:        c.entryCfg.ParentID,
-			},
-			Selectors: c.entryCfg.SelectorsFunc(id),
-		},
-	}
+	desired := []*types.Entry{c.entryCfg.entry(c.cfg.SpiffeTrustDomain, id)}
 
 	if entries == nil || len(entries.Entries) == 0 {
 		_, err = c.entry.BatchCreateEntry(ctx, &entryv1.BatchCreateEntryRequest{Entries: desired})
@@ -285,17 +199,7 @@ func (c *EntryClient) UpsertBatch(ctx context.Context, ids []string) error {
 	// Build entries for all IDs
 	entries := make([]*types.Entry, 0, len(ids))
 	for _, id := range ids {
-		entries = append(entries, &types.Entry{
-			SpiffeId: &types.SPIFFEID{
-				TrustDomain: c.cfg.SpiffeTrustDomain,
-				Path:        c.entryCfg.PathFunc(id),
-			},
-			ParentId: &types.SPIFFEID{
-				TrustDomain: c.cfg.SpiffeTrustDomain,
-				Path:        c.entryCfg.ParentID,
-			},
-			Selectors: c.entryCfg.SelectorsFunc(id),
-		})
+		entries = append(entries, c.entryCfg.entry(c.cfg.SpiffeTrustDomain, id))
 	}
 
 	resp, err := c.entry.BatchCreateEntry(ctx,
