@@ -35,6 +35,8 @@ import (
 	"github.com/cilium/cilium/pkg/networkdriver/config"
 	"github.com/cilium/cilium/pkg/networkdriver/dummy"
 	networkdriverIPAM "github.com/cilium/cilium/pkg/networkdriver/ipam"
+	"github.com/cilium/cilium/pkg/networkdriver/rxqueue"
+	"github.com/cilium/cilium/pkg/networkdriver/sriov"
 	"github.com/cilium/cilium/pkg/networkdriver/types"
 	nodetypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
@@ -92,6 +94,64 @@ func TestSerializeDevice(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, dev.IfName(), restored.IfName())
 	})
+
+	t.Run("RX queue device round-trip", func(t *testing.T) {
+		dev := &rxqueue.RXQueueDevice{
+			PhysicalIfName:   "eth0",
+			TotalRXQueues:    8,
+			ReservedQueueIDs: []uint32{7, 6},
+		}
+		capacity := map[resourceapi.QualifiedName]apiresource.Quantity{
+			types.RXQueuesCapacity: apiresource.MustParse("1"),
+		}
+		a := allocation{Device: dev, Manager: types.DeviceManagerTypeRXQueue, ConsumedCapacity: capacity}
+
+		raw, err := serializeDevice(a)
+		require.NoError(t, err)
+
+		serialized, err := deserializeDevice(raw)
+		require.NoError(t, err)
+		require.Equal(t, types.DeviceManagerTypeRXQueue, serialized.Manager)
+		require.Equal(t, capacity, serialized.ConsumedCapacity)
+
+		mgr := &rxqueue.RXQueueManager{}
+		restored, err := mgr.RestoreDevice(serialized.Dev)
+		require.NoError(t, err)
+		require.Equal(t, dev.IfName(), restored.IfName())
+	})
+}
+
+func TestAllocationInterfaceName(t *testing.T) {
+	tests := []struct {
+		name         string
+		kernelIfName string
+		podIfName    string
+		want         string
+	}{
+		{"kernel interface", "ens1f1v0", "", "ens1f1v0"},
+		{"explicit Pod interface", "ens1f1v0", "net1", "net1"},
+		{"unknown kernel interface", "", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dev := &sriov.PciDevice{Addr: "0000:17:02.4", KernelIfaceName: tt.kernelIfName}
+			a := allocation{
+				Device:  dev,
+				Manager: types.DeviceManagerTypeSRIOV,
+				Config:  types.DeviceConfig{PodIfName: tt.podIfName},
+			}
+			result := resourceapi.DeviceRequestAllocationResult{Device: dev.IfName()}
+			driver := &Driver{config: &v2alpha1.CiliumNetworkDriverNodeConfigSpec{DriverName: prepTestDriverName}}
+			status, err := driver.buildDeviceStatus(&resourceapi.ResourceClaim{}, result, a)
+			require.NoError(t, err)
+			devices := prepareResultDevices([]resourceapi.DeviceRequestAllocationResult{result}, []allocation{a})
+
+			assert.Equal(t, tt.want, status.NetworkData.InterfaceName)
+			assert.Equal(t, tt.want, devices[0].Metadata.NetworkData.InterfaceName)
+			assert.Equal(t, "0000-17-02-4", status.Device)
+			assert.Equal(t, "0000-17-02-4", devices[0].DeviceName)
+		})
+	}
 }
 
 func TestBuildDeviceStatus(t *testing.T) {
