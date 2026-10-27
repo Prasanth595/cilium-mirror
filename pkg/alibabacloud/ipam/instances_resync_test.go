@@ -5,6 +5,7 @@ package ipam
 
 import (
 	"context"
+	"net/netip"
 	"testing"
 
 	"github.com/cilium/hive/hivetest"
@@ -46,6 +47,35 @@ func newHookedInstancesManager(t *testing.T) (*apimock.API, *hookedAPI, *Instanc
 
 func TestFullResync(t *testing.T) {
 	const instanceID = "i-1"
+
+	t.Run("IPRelease", func(t *testing.T) {
+		t.Parallel()
+		api, hooked, mngr := newHookedInstancesManager(t)
+		eniID, eni, err := api.CreateNetworkInterface(t.Context(), 2, "vsw-1", []string{"sg-1"}, nil)
+		require.NoError(t, err)
+		require.NoError(t, api.AttachNetworkInterface(t.Context(), instanceID, eniID))
+		_, err = mngr.Resync(t.Context())
+		require.NoError(t, err)
+		require.Len(t, eni.PrivateIPSets, 3)
+		released := eni.PrivateIPSets[1].PrivateIpAddress
+
+		resynctest.RunDuringFullResync(t, mngr, hooked.setHook,
+			func() error {
+				return api.UnassignPrivateIPAddresses(t.Context(), eniID, []string{released.String()})
+			},
+			func() {
+				mngr.RemoveIPsFromENI(instanceID, eniID, []netip.Prefix{netip.PrefixFrom(released.Addr, 32)})
+			})
+
+		var addresses []types.PrivateIPSet
+		mngr.ForeachInstance(instanceID, func(_, interfaceID string, iface ipamTypes.Interface) error {
+			if interfaceID == eniID {
+				addresses = iface.(*types.ENI).PrivateIPSets
+			}
+			return nil
+		})
+		require.ElementsMatch(t, []types.PrivateIPSet{eni.PrivateIPSets[0], eni.PrivateIPSets[2]}, addresses)
+	})
 
 	t.Run("ENIUpdate", func(t *testing.T) {
 		t.Parallel()
