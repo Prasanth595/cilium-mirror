@@ -2,38 +2,37 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package checker defines the implementation of the checker commands.
-// The same code drives the multi-analysis driver, the single-analysis
-// driver that is conventionally provided for convenience along with
-// each analysis package, and the test driver.
+// Package internal/checker defines various implementation helpers for
+// the singlechecker and multichecker packages, which provide the
+// complete main function for an analysis driver executable
+// based on go/packages.
+//
+// (Note: it is not used by the public 'checker' package, since the
+// latter provides a set of pure functions for use as building blocks.)
 package checker
 
+// TODO(adonovan): publish the JSON schema in go/analysis or analysisjson.
+
 import (
-	"bytes"
-	"encoding/gob"
 	"flag"
 	"fmt"
-	"go/format"
-	"go/parser"
-	"go/token"
-	"go/types"
-	"io/ioutil"
+	"io"
+
 	"log"
 	"os"
-	"reflect"
 	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/checker"
+	"golang.org/x/tools/go/analysis/internal"
 	"golang.org/x/tools/go/analysis/internal/analysisflags"
 	"golang.org/x/tools/go/packages"
-	"golang.org/x/tools/internal/analysisinternal"
-	"golang.org/x/tools/internal/span"
+	"golang.org/x/tools/internal/analysis/driverutil"
 )
 
 var (
@@ -50,8 +49,8 @@ var (
 	// Log files for optional performance tracing.
 	CPUProfile, MemProfile, Trace string
 
-	// Fix determines whether to apply all suggested fixes.
-	Fix bool
+	// IncludeTests indicates whether test files should be analyzed too.
+	IncludeTests = true
 )
 
 // RegisterFlags registers command-line flags used by the analysis driver.
@@ -64,17 +63,46 @@ func RegisterFlags() {
 	flag.StringVar(&CPUProfile, "cpuprofile", "", "write CPU profile to this file")
 	flag.StringVar(&MemProfile, "memprofile", "", "write memory profile to this file")
 	flag.StringVar(&Trace, "trace", "", "write trace log to this file")
-
-	flag.BoolVar(&Fix, "fix", false, "apply all suggested fixes")
+	flag.BoolVar(&IncludeTests, "test", IncludeTests, "indicates whether test files should be analyzed, too")
 }
 
 // Run loads the packages specified by args using go/packages,
 // then applies the specified analyzers to them.
 // Analysis flags must already have been set.
+// Analyzers must be valid according to [analysis.Validate].
 // It provides most of the logic for the main functions of both the
 // singlechecker and the multi-analysis commands.
 // It returns the appropriate exit code.
+//
+// TODO(adonovan): tests should not call this function directly.
+// Fiddling with global variables (flags such as [analysisflags.Fix])
+// is error-prone and hostile to parallelism. Instead, use unit tests
+// of the actual units (e.g. checker.Analyze) and integration tests
+// (e.g. TestScript) of whole executables.
 func Run(args []string, analyzers []*analysis.Analyzer) (exitcode int) {
+	// Instead of returning a code directly,
+	// call this function to monotonically increase the exit code.
+	// This allows us to keep going in the face of some errors
+	// without having to remember what code to return.
+	//
+	// TODO(adonovan): interpreting exit codes is like reading tea-leaves.
+	// Instead of wasting effort trying to encode a multidimensional result
+	// into 7 bits we should just emit structured JSON output, and
+	// an exit code of 0 or 1 for success or failure.
+	exitAtLeast := func(code int) {
+		exitcode = max(code, exitcode)
+	}
+
+	// Since analysisflags is linked in (for {single,multi}checker),
+	// the -v flag is registered for complex legacy reasons
+	// related to cmd/vet CLI.
+	// Treat it as an undocumented alias for -debug=v.
+	if v := flag.CommandLine.Lookup("v"); v != nil &&
+		v.Value.(flag.Getter).Get() == true &&
+		!strings.Contains(Debug, "v") {
+		Debug += "v"
+	}
+
 	if CPUProfile != "" {
 		f, err := os.Create(CPUProfile)
 		if err != nil {
@@ -130,347 +158,107 @@ func Run(args []string, analyzers []*analysis.Analyzer) (exitcode int) {
 	initial, err := load(args, allSyntax)
 	if err != nil {
 		log.Print(err)
-		return 1 // load errors
+		exitAtLeast(1)
+		return
 	}
 
-	// Print the results.
-	roots := analyze(initial, analyzers)
-
-	if Fix {
-		applyFixes(roots)
+	// Print package and module errors regardless of RunDespiteErrors.
+	// Do not exit if there are errors, yet.
+	if n := packages.PrintErrors(initial); n > 0 {
+		exitAtLeast(1)
 	}
 
-	return printDiagnostics(roots)
-}
-
-// load loads the initial packages.
-func load(patterns []string, allSyntax bool) ([]*packages.Package, error) {
-	mode := packages.LoadSyntax
-	if allSyntax {
-		mode = packages.LoadAllSyntax
-	}
-	conf := packages.Config{
-		Mode:  mode,
-		Tests: true,
-	}
-	initial, err := packages.Load(&conf, patterns...)
-	if err == nil {
-		if n := packages.PrintErrors(initial); n > 1 {
-			err = fmt.Errorf("%d errors during loading", n)
-		} else if n == 1 {
-			err = fmt.Errorf("error during loading")
-		} else if len(initial) == 0 {
-			err = fmt.Errorf("%s matched no packages", strings.Join(patterns, " "))
-		}
+	var factLog io.Writer
+	if dbg('f') {
+		factLog = os.Stderr
 	}
 
-	return initial, err
-}
-
-// TestAnalyzer applies an analysis to a set of packages (and their
-// dependencies if necessary) and returns the results.
-//
-// Facts about pkg are returned in a map keyed by object; package facts
-// have a nil key.
-//
-// This entry point is used only by analysistest.
-func TestAnalyzer(a *analysis.Analyzer, pkgs []*packages.Package) []*TestAnalyzerResult {
-	var results []*TestAnalyzerResult
-	for _, act := range analyze(pkgs, []*analysis.Analyzer{a}) {
-		facts := make(map[types.Object][]analysis.Fact)
-		for key, fact := range act.objectFacts {
-			if key.obj.Pkg() == act.pass.Pkg {
-				facts[key.obj] = append(facts[key.obj], fact)
-			}
-		}
-		for key, fact := range act.packageFacts {
-			if key.pkg == act.pass.Pkg {
-				facts[nil] = append(facts[nil], fact)
-			}
-		}
-
-		results = append(results, &TestAnalyzerResult{act.pass, act.diagnostics, facts, act.result, act.err})
+	// Run the analysis.
+	opts := &checker.Options{
+		SanityCheck: dbg('s'),
+		Sequential:  dbg('p'),
+		FactLog:     factLog,
 	}
-	return results
-}
-
-type TestAnalyzerResult struct {
-	Pass        *analysis.Pass
-	Diagnostics []analysis.Diagnostic
-	Facts       map[types.Object][]analysis.Fact
-	Result      interface{}
-	Err         error
-}
-
-func analyze(pkgs []*packages.Package, analyzers []*analysis.Analyzer) []*action {
-	// Construct the action graph.
 	if dbg('v') {
 		log.Printf("building graph of analysis passes")
 	}
-
-	// Each graph node (action) is one unit of analysis.
-	// Edges express package-to-package (vertical) dependencies,
-	// and analysis-to-analysis (horizontal) dependencies.
-	type key struct {
-		*analysis.Analyzer
-		*packages.Package
+	graph, err := checker.Analyze(analyzers, initial, opts)
+	if err != nil {
+		log.Print(err)
+		exitAtLeast(1)
+		return
 	}
-	actions := make(map[key]*action)
 
-	var mkAction func(a *analysis.Analyzer, pkg *packages.Package) *action
-	mkAction = func(a *analysis.Analyzer, pkg *packages.Package) *action {
-		k := key{a, pkg}
-		act, ok := actions[k]
-		if !ok {
-			act = &action{a: a, pkg: pkg}
-
-			// Add a dependency on each required analyzers.
-			for _, req := range a.Requires {
-				act.deps = append(act.deps, mkAction(req, pkg))
-			}
-
-			// An analysis that consumes/produces facts
-			// must run on the package's dependencies too.
-			if len(a.FactTypes) > 0 {
-				paths := make([]string, 0, len(pkg.Imports))
-				for path := range pkg.Imports {
-					paths = append(paths, path)
-				}
-				sort.Strings(paths) // for determinism
-				for _, path := range paths {
-					dep := mkAction(a, pkg.Imports[path])
-					act.deps = append(act.deps, dep)
+	// Don't print the diagnostics,
+	// but apply all fixes from the root actions.
+	if analysisflags.Fix {
+		fixActions := make([]driverutil.FixAction, len(graph.Roots))
+		for i, act := range graph.Roots {
+			if pass := internal.ActionPass(act); pass != nil {
+				fixActions[i] = driverutil.FixAction{
+					Name:         act.String(),
+					Pkg:          act.Package.Types,
+					Files:        act.Package.Syntax,
+					FileSet:      act.Package.Fset,
+					ReadFileFunc: pass.ReadFile,
+					Diagnostics:  act.Diagnostics,
 				}
 			}
-
-			actions[k] = act
 		}
-		return act
+		write := func(filename string, content []byte) error {
+			return os.WriteFile(filename, content, 0644)
+		}
+		if err := driverutil.ApplyFixes(fixActions, write, analysisflags.Diff, dbg('v')); err != nil {
+			// Fail when applying fixes failed.
+			log.Print(err)
+			exitAtLeast(1)
+			return
+		}
+		// Don't proceed to print text/JSON,
+		// and don't report an error
+		// just because there were diagnostics.
+		return
 	}
 
-	// Build nodes for initial packages.
-	var roots []*action
-	for _, a := range analyzers {
-		for _, pkg := range pkgs {
-			root := mkAction(a, pkg)
-			root.isroot = true
-			roots = append(roots, root)
-		}
-	}
+	// Print the results. If !RunDespiteErrors and there
+	// are errors in the packages, this will have 0 exit
+	// code. Otherwise, we prefer to return exit code
+	// indicating diagnostics.
+	exitAtLeast(printDiagnostics(graph))
 
-	// Execute the graph in parallel.
-	execAll(roots)
-
-	return roots
+	return
 }
 
-func applyFixes(roots []*action) {
-	visited := make(map[*action]bool)
-	var apply func(*action) error
-	var visitAll func(actions []*action) error
-	visitAll = func(actions []*action) error {
-		for _, act := range actions {
-			if !visited[act] {
-				visited[act] = true
-				visitAll(act.deps)
-				if err := apply(act); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
+// printDiagnostics prints diagnostics in text or JSON form
+// and returns the appropriate exit code.
+func printDiagnostics(graph *checker.Graph) (exitcode int) {
+	// Keep consistent with analogous logic in
+	// processResults in ../../unitchecker/unitchecker.go.
 
-	// TODO(matloob): Is this tree business too complicated? (After all this is Go!)
-	// Just create a set (map) of edits, sort by pos and call it a day?
-	type offsetedit struct {
-		start, end int
-		newText    []byte
-	} // TextEdit using byteOffsets instead of pos
-	type node struct {
-		edit        offsetedit
-		left, right *node
-	}
-
-	var insert func(tree **node, edit offsetedit) error
-	insert = func(treeptr **node, edit offsetedit) error {
-		if *treeptr == nil {
-			*treeptr = &node{edit, nil, nil}
-			return nil
-		}
-		tree := *treeptr
-		if edit.end <= tree.edit.start {
-			return insert(&tree.left, edit)
-		} else if edit.start >= tree.edit.end {
-			return insert(&tree.right, edit)
-		}
-
-		// Overlapping text edit.
-		return fmt.Errorf("analyses applying overlapping text edits affecting pos range (%v, %v) and (%v, %v)",
-			edit.start, edit.end, tree.edit.start, tree.edit.end)
-
-	}
-
-	editsForFile := make(map[*token.File]*node)
-
-	apply = func(act *action) error {
-		for _, diag := range act.diagnostics {
-			for _, sf := range diag.SuggestedFixes {
-				for _, edit := range sf.TextEdits {
-					// Validate the edit.
-					if edit.Pos > edit.End {
-						return fmt.Errorf(
-							"diagnostic for analysis %v contains Suggested Fix with malformed edit: pos (%v) > end (%v)",
-							act.a.Name, edit.Pos, edit.End)
-					}
-					file, endfile := act.pkg.Fset.File(edit.Pos), act.pkg.Fset.File(edit.End)
-					if file == nil || endfile == nil || file != endfile {
-						return (fmt.Errorf(
-							"diagnostic for analysis %v contains Suggested Fix with malformed spanning files %v and %v",
-							act.a.Name, file.Name(), endfile.Name()))
-					}
-					start, end := file.Offset(edit.Pos), file.Offset(edit.End)
-
-					// TODO(matloob): Validate that edits do not affect other packages.
-					root := editsForFile[file]
-					if err := insert(&root, offsetedit{start, end, edit.NewText}); err != nil {
-						return err
-					}
-					editsForFile[file] = root // In case the root changed
-				}
-			}
-		}
-		return nil
-	}
-
-	visitAll(roots)
-
-	fset := token.NewFileSet() // Shared by parse calls below
-	// Now we've got a set of valid edits for each file. Get the new file contents.
-	for f, tree := range editsForFile {
-		contents, err := ioutil.ReadFile(f.Name())
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		cur := 0 // current position in the file
-
-		var out bytes.Buffer
-
-		var recurse func(*node)
-		recurse = func(node *node) {
-			if node.left != nil {
-				recurse(node.left)
-			}
-
-			edit := node.edit
-			if edit.start > cur {
-				out.Write(contents[cur:edit.start])
-				out.Write(edit.newText)
-			}
-			cur = edit.end
-
-			if node.right != nil {
-				recurse(node.right)
-			}
-		}
-		recurse(tree)
-		// Write out the rest of the file.
-		if cur < len(contents) {
-			out.Write(contents[cur:])
-		}
-
-		// Try to format the file.
-		ff, err := parser.ParseFile(fset, f.Name(), out.Bytes(), parser.ParseComments)
-		if err == nil {
-			var buf bytes.Buffer
-			if err = format.Node(&buf, fset, ff); err == nil {
-				out = buf
-			}
-		}
-
-		ioutil.WriteFile(f.Name(), out.Bytes(), 0644)
-	}
-}
-
-// printDiagnostics prints the diagnostics for the root packages in either
-// plain text or JSON format. JSON format also includes errors for any
-// dependencies.
-//
-// It returns the exitcode: in plain mode, 0 for success, 1 for analysis
-// errors, and 3 for diagnostics. We avoid 2 since the flag package uses
-// it. JSON mode always succeeds at printing errors and diagnostics in a
-// structured form to stdout.
-func printDiagnostics(roots []*action) (exitcode int) {
-	// Print the output.
-	//
-	// Print diagnostics only for root packages,
-	// but errors for all packages.
-	printed := make(map[*action]bool)
-	var print func(*action)
-	var visitAll func(actions []*action)
-	visitAll = func(actions []*action) {
-		for _, act := range actions {
-			if !printed[act] {
-				printed[act] = true
-				visitAll(act.deps)
-				print(act)
-			}
-		}
-	}
-
+	// Print the results.
+	// With -json, the exit code is always zero.
 	if analysisflags.JSON {
-		// JSON output
-		tree := make(analysisflags.JSONTree)
-		print = func(act *action) {
-			var diags []analysis.Diagnostic
-			if act.isroot {
-				diags = act.diagnostics
-			}
-			tree.Add(act.pkg.Fset, act.pkg.ID, act.a.Name, diags, act.err)
+		if err := graph.PrintJSON(os.Stdout); err != nil {
+			return 1
 		}
-		visitAll(roots)
-		tree.Print()
 	} else {
-		// plain text output
-
-		// De-duplicate diagnostics by position (not token.Pos) to
-		// avoid double-reporting in source files that belong to
-		// multiple packages, such as foo and foo.test.
-		type key struct {
-			pos token.Position
-			end token.Position
-			*analysis.Analyzer
-			message string
+		if err := graph.PrintText(os.Stderr, analysisflags.Context); err != nil {
+			return 1
 		}
-		seen := make(map[key]bool)
 
-		print = func(act *action) {
-			if act.err != nil {
-				fmt.Fprintf(os.Stderr, "%s: %v\n", act.a.Name, act.err)
-				exitcode = 1 // analysis failed, at least partially
-				return
-			}
-			if act.isroot {
-				for _, diag := range act.diagnostics {
-					// We don't display a.Name/f.Category
-					// as most users don't care.
-
-					posn := act.pkg.Fset.Position(diag.Pos)
-					end := act.pkg.Fset.Position(diag.End)
-					k := key{posn, end, act.a, diag.Message}
-					if seen[k] {
-						continue // duplicate
-					}
-					seen[k] = true
-
-					analysisflags.PrintPlain(act.pkg.Fset, diag)
-				}
+		// Compute the exit code.
+		var numErrors, rootDiags int
+		for act := range graph.All() {
+			if act.Err != nil {
+				numErrors++
+			} else if act.IsRoot {
+				rootDiags += len(act.Diagnostics)
 			}
 		}
-		visitAll(roots)
 
-		if exitcode == 0 && len(seen) > 0 {
+		if numErrors > 0 {
+			exitcode = 1 // analysis failed, at least partially
+		} else if rootDiags > 0 {
 			exitcode = 3 // successfully produced diagnostics
 		}
 	}
@@ -480,28 +268,57 @@ func printDiagnostics(roots []*action) (exitcode int) {
 		if !dbg('p') {
 			log.Println("Warning: times are mostly GC/scheduler noise; use -debug=tp to disable parallelism")
 		}
-		var all []*action
+
+		var list []*checker.Action
 		var total time.Duration
-		for act := range printed {
-			all = append(all, act)
-			total += act.duration
+		for act := range graph.All() {
+			list = append(list, act)
+			total += act.Duration
 		}
-		sort.Slice(all, func(i, j int) bool {
-			return all[i].duration > all[j].duration
-		})
 
 		// Print actions accounting for 90% of the total.
+		sort.Slice(list, func(i, j int) bool {
+			return list[i].Duration > list[j].Duration
+		})
 		var sum time.Duration
-		for _, act := range all {
-			fmt.Fprintf(os.Stderr, "%s\t%s\n", act.duration, act)
-			sum += act.duration
+		for _, act := range list {
+			fmt.Fprintf(os.Stderr, "%s\t%s\n", act.Duration, act)
+			sum += act.Duration
 			if sum >= total*9/10 {
 				break
 			}
 		}
+		if total > sum {
+			fmt.Fprintf(os.Stderr, "%s\tall others\n", total-sum)
+		}
 	}
 
 	return exitcode
+}
+
+// load loads the initial packages. Returns only top-level loading
+// errors. Does not consider errors in packages.
+func load(patterns []string, allSyntax bool) ([]*packages.Package, error) {
+	mode := packages.LoadSyntax
+	if allSyntax {
+		mode = packages.LoadAllSyntax
+	}
+	mode |= packages.NeedModule
+	conf := packages.Config{
+		Mode: mode,
+		// Ensure that child process inherits correct alias of PWD.
+		// (See discussion at Dir field of [exec.Command].)
+		// However, this currently breaks some tests.
+		// TODO(adonovan): Investigate.
+		//
+		// Dir:   os.Getenv("PWD"),
+		Tests: IncludeTests,
+	}
+	initial, err := packages.Load(&conf, patterns...)
+	if err == nil && len(initial) == 0 {
+		err = fmt.Errorf("%s matched no packages", strings.Join(patterns, " "))
+	}
+	return initial, err
 }
 
 // needFacts reports whether any analysis required by the specified set
@@ -522,386 +339,6 @@ func needFacts(analyzers []*analysis.Analyzer) bool {
 		}
 	}
 	return false
-}
-
-// An action represents one unit of analysis work: the application of
-// one analysis to one package. Actions form a DAG, both within a
-// package (as different analyzers are applied, either in sequence or
-// parallel), and across packages (as dependencies are analyzed).
-type action struct {
-	once         sync.Once
-	a            *analysis.Analyzer
-	pkg          *packages.Package
-	pass         *analysis.Pass
-	isroot       bool
-	deps         []*action
-	objectFacts  map[objectFactKey]analysis.Fact
-	packageFacts map[packageFactKey]analysis.Fact
-	inputs       map[*analysis.Analyzer]interface{}
-	result       interface{}
-	diagnostics  []analysis.Diagnostic
-	err          error
-	duration     time.Duration
-}
-
-type objectFactKey struct {
-	obj types.Object
-	typ reflect.Type
-}
-
-type packageFactKey struct {
-	pkg *types.Package
-	typ reflect.Type
-}
-
-func (act *action) String() string {
-	return fmt.Sprintf("%s@%s", act.a, act.pkg)
-}
-
-func execAll(actions []*action) {
-	sequential := dbg('p')
-	var wg sync.WaitGroup
-	for _, act := range actions {
-		wg.Add(1)
-		work := func(act *action) {
-			act.exec()
-			wg.Done()
-		}
-		if sequential {
-			work(act)
-		} else {
-			go work(act)
-		}
-	}
-	wg.Wait()
-}
-
-func (act *action) exec() { act.once.Do(act.execOnce) }
-
-func (act *action) execOnce() {
-	// Analyze dependencies.
-	execAll(act.deps)
-
-	// TODO(adonovan): uncomment this during profiling.
-	// It won't build pre-go1.11 but conditional compilation
-	// using build tags isn't warranted.
-	//
-	// ctx, task := trace.NewTask(context.Background(), "exec")
-	// trace.Log(ctx, "pass", act.String())
-	// defer task.End()
-
-	// Record time spent in this node but not its dependencies.
-	// In parallel mode, due to GC/scheduler contention, the
-	// time is 5x higher than in sequential mode, even with a
-	// semaphore limiting the number of threads here.
-	// So use -debug=tp.
-	if dbg('t') {
-		t0 := time.Now()
-		defer func() { act.duration = time.Since(t0) }()
-	}
-
-	// Report an error if any dependency failed.
-	var failed []string
-	for _, dep := range act.deps {
-		if dep.err != nil {
-			failed = append(failed, dep.String())
-		}
-	}
-	if failed != nil {
-		sort.Strings(failed)
-		act.err = fmt.Errorf("failed prerequisites: %s", strings.Join(failed, ", "))
-		return
-	}
-
-	// Plumb the output values of the dependencies
-	// into the inputs of this action.  Also facts.
-	inputs := make(map[*analysis.Analyzer]interface{})
-	act.objectFacts = make(map[objectFactKey]analysis.Fact)
-	act.packageFacts = make(map[packageFactKey]analysis.Fact)
-	for _, dep := range act.deps {
-		if dep.pkg == act.pkg {
-			// Same package, different analysis (horizontal edge):
-			// in-memory outputs of prerequisite analyzers
-			// become inputs to this analysis pass.
-			inputs[dep.a] = dep.result
-
-		} else if dep.a == act.a { // (always true)
-			// Same analysis, different package (vertical edge):
-			// serialized facts produced by prerequisite analysis
-			// become available to this analysis pass.
-			inheritFacts(act, dep)
-		}
-	}
-
-	// Run the analysis.
-	pass := &analysis.Pass{
-		Analyzer:          act.a,
-		Fset:              act.pkg.Fset,
-		Files:             act.pkg.Syntax,
-		OtherFiles:        act.pkg.OtherFiles,
-		IgnoredFiles:      act.pkg.IgnoredFiles,
-		Pkg:               act.pkg.Types,
-		TypesInfo:         act.pkg.TypesInfo,
-		TypesSizes:        act.pkg.TypesSizes,
-		ResultOf:          inputs,
-		Report:            func(d analysis.Diagnostic) { act.diagnostics = append(act.diagnostics, d) },
-		ImportObjectFact:  act.importObjectFact,
-		ExportObjectFact:  act.exportObjectFact,
-		ImportPackageFact: act.importPackageFact,
-		ExportPackageFact: act.exportPackageFact,
-		AllObjectFacts:    act.allObjectFacts,
-		AllPackageFacts:   act.allPackageFacts,
-	}
-	act.pass = pass
-
-	var errors []types.Error
-	// Get any type errors that are attributed to the pkg.
-	// This is necessary to test analyzers that provide
-	// suggested fixes for compiler/type errors.
-	for _, err := range act.pkg.Errors {
-		if err.Kind != packages.TypeError {
-			continue
-		}
-		// err.Pos is a string of form: "file:line:col" or "file:line" or "" or "-"
-		spn := span.Parse(err.Pos)
-		// Extract the token positions from the error string.
-		line, col, offset := spn.Start().Line(), spn.Start().Column(), -1
-		act.pkg.Fset.Iterate(func(f *token.File) bool {
-			if f.Name() != spn.URI().Filename() {
-				return true
-			}
-			offset = int(f.LineStart(line)) + col - 1
-			return false
-		})
-		if offset == -1 {
-			continue
-		}
-		errors = append(errors, types.Error{
-			Fset: act.pkg.Fset,
-			Msg:  err.Msg,
-			Pos:  token.Pos(offset),
-		})
-	}
-	analysisinternal.SetTypeErrors(pass, errors)
-
-	var err error
-	if act.pkg.IllTyped && !pass.Analyzer.RunDespiteErrors {
-		err = fmt.Errorf("analysis skipped due to errors in package")
-	} else {
-		act.result, err = pass.Analyzer.Run(pass)
-		if err == nil {
-			if got, want := reflect.TypeOf(act.result), pass.Analyzer.ResultType; got != want {
-				err = fmt.Errorf(
-					"internal error: on package %s, analyzer %s returned a result of type %v, but declared ResultType %v",
-					pass.Pkg.Path(), pass.Analyzer, got, want)
-			}
-		}
-	}
-	act.err = err
-
-	// disallow calls after Run
-	pass.ExportObjectFact = nil
-	pass.ExportPackageFact = nil
-}
-
-// inheritFacts populates act.facts with
-// those it obtains from its dependency, dep.
-func inheritFacts(act, dep *action) {
-	serialize := dbg('s')
-
-	for key, fact := range dep.objectFacts {
-		// Filter out facts related to objects
-		// that are irrelevant downstream
-		// (equivalently: not in the compiler export data).
-		if !exportedFrom(key.obj, dep.pkg.Types) {
-			if false {
-				log.Printf("%v: discarding %T fact from %s for %s: %s", act, fact, dep, key.obj, fact)
-			}
-			continue
-		}
-
-		// Optionally serialize/deserialize fact
-		// to verify that it works across address spaces.
-		if serialize {
-			encodedFact, err := codeFact(fact)
-			if err != nil {
-				log.Panicf("internal error: encoding of %T fact failed in %v", fact, act)
-			}
-			fact = encodedFact
-		}
-
-		if false {
-			log.Printf("%v: inherited %T fact for %s: %s", act, fact, key.obj, fact)
-		}
-		act.objectFacts[key] = fact
-	}
-
-	for key, fact := range dep.packageFacts {
-		// TODO: filter out facts that belong to
-		// packages not mentioned in the export data
-		// to prevent side channels.
-
-		// Optionally serialize/deserialize fact
-		// to verify that it works across address spaces
-		// and is deterministic.
-		if serialize {
-			encodedFact, err := codeFact(fact)
-			if err != nil {
-				log.Panicf("internal error: encoding of %T fact failed in %v", fact, act)
-			}
-			fact = encodedFact
-		}
-
-		if false {
-			log.Printf("%v: inherited %T fact for %s: %s", act, fact, key.pkg.Path(), fact)
-		}
-		act.packageFacts[key] = fact
-	}
-}
-
-// codeFact encodes then decodes a fact,
-// just to exercise that logic.
-func codeFact(fact analysis.Fact) (analysis.Fact, error) {
-	// We encode facts one at a time.
-	// A real modular driver would emit all facts
-	// into one encoder to improve gob efficiency.
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(fact); err != nil {
-		return nil, err
-	}
-
-	// Encode it twice and assert that we get the same bits.
-	// This helps detect nondeterministic Gob encoding (e.g. of maps).
-	var buf2 bytes.Buffer
-	if err := gob.NewEncoder(&buf2).Encode(fact); err != nil {
-		return nil, err
-	}
-	if !bytes.Equal(buf.Bytes(), buf2.Bytes()) {
-		return nil, fmt.Errorf("encoding of %T fact is nondeterministic", fact)
-	}
-
-	new := reflect.New(reflect.TypeOf(fact).Elem()).Interface().(analysis.Fact)
-	if err := gob.NewDecoder(&buf).Decode(new); err != nil {
-		return nil, err
-	}
-	return new, nil
-}
-
-// exportedFrom reports whether obj may be visible to a package that imports pkg.
-// This includes not just the exported members of pkg, but also unexported
-// constants, types, fields, and methods, perhaps belonging to oether packages,
-// that find there way into the API.
-// This is an overapproximation of the more accurate approach used by
-// gc export data, which walks the type graph, but it's much simpler.
-//
-// TODO(adonovan): do more accurate filtering by walking the type graph.
-func exportedFrom(obj types.Object, pkg *types.Package) bool {
-	switch obj := obj.(type) {
-	case *types.Func:
-		return obj.Exported() && obj.Pkg() == pkg ||
-			obj.Type().(*types.Signature).Recv() != nil
-	case *types.Var:
-		if obj.IsField() {
-			return true
-		}
-		// we can't filter more aggressively than this because we need
-		// to consider function parameters exported, but have no way
-		// of telling apart function parameters from local variables.
-		return obj.Pkg() == pkg
-	case *types.TypeName, *types.Const:
-		return true
-	}
-	return false // Nil, Builtin, Label, or PkgName
-}
-
-// importObjectFact implements Pass.ImportObjectFact.
-// Given a non-nil pointer ptr of type *T, where *T satisfies Fact,
-// importObjectFact copies the fact value to *ptr.
-func (act *action) importObjectFact(obj types.Object, ptr analysis.Fact) bool {
-	if obj == nil {
-		panic("nil object")
-	}
-	key := objectFactKey{obj, factType(ptr)}
-	if v, ok := act.objectFacts[key]; ok {
-		reflect.ValueOf(ptr).Elem().Set(reflect.ValueOf(v).Elem())
-		return true
-	}
-	return false
-}
-
-// exportObjectFact implements Pass.ExportObjectFact.
-func (act *action) exportObjectFact(obj types.Object, fact analysis.Fact) {
-	if act.pass.ExportObjectFact == nil {
-		log.Panicf("%s: Pass.ExportObjectFact(%s, %T) called after Run", act, obj, fact)
-	}
-
-	if obj.Pkg() != act.pkg.Types {
-		log.Panicf("internal error: in analysis %s of package %s: Fact.Set(%s, %T): can't set facts on objects belonging another package",
-			act.a, act.pkg, obj, fact)
-	}
-
-	key := objectFactKey{obj, factType(fact)}
-	act.objectFacts[key] = fact // clobber any existing entry
-	if dbg('f') {
-		objstr := types.ObjectString(obj, (*types.Package).Name)
-		fmt.Fprintf(os.Stderr, "%s: object %s has fact %s\n",
-			act.pkg.Fset.Position(obj.Pos()), objstr, fact)
-	}
-}
-
-// allObjectFacts implements Pass.AllObjectFacts.
-func (act *action) allObjectFacts() []analysis.ObjectFact {
-	facts := make([]analysis.ObjectFact, 0, len(act.objectFacts))
-	for k := range act.objectFacts {
-		facts = append(facts, analysis.ObjectFact{k.obj, act.objectFacts[k]})
-	}
-	return facts
-}
-
-// importPackageFact implements Pass.ImportPackageFact.
-// Given a non-nil pointer ptr of type *T, where *T satisfies Fact,
-// fact copies the fact value to *ptr.
-func (act *action) importPackageFact(pkg *types.Package, ptr analysis.Fact) bool {
-	if pkg == nil {
-		panic("nil package")
-	}
-	key := packageFactKey{pkg, factType(ptr)}
-	if v, ok := act.packageFacts[key]; ok {
-		reflect.ValueOf(ptr).Elem().Set(reflect.ValueOf(v).Elem())
-		return true
-	}
-	return false
-}
-
-// exportPackageFact implements Pass.ExportPackageFact.
-func (act *action) exportPackageFact(fact analysis.Fact) {
-	if act.pass.ExportPackageFact == nil {
-		log.Panicf("%s: Pass.ExportPackageFact(%T) called after Run", act, fact)
-	}
-
-	key := packageFactKey{act.pass.Pkg, factType(fact)}
-	act.packageFacts[key] = fact // clobber any existing entry
-	if dbg('f') {
-		fmt.Fprintf(os.Stderr, "%s: package %s has fact %s\n",
-			act.pkg.Fset.Position(act.pass.Files[0].Pos()), act.pass.Pkg.Path(), fact)
-	}
-}
-
-func factType(fact analysis.Fact) reflect.Type {
-	t := reflect.TypeOf(fact)
-	if t.Kind() != reflect.Ptr {
-		log.Fatalf("invalid Fact type: got %T, want pointer", t)
-	}
-	return t
-}
-
-// allObjectFacts implements Pass.AllObjectFacts.
-func (act *action) allPackageFacts() []analysis.PackageFact {
-	facts := make([]analysis.PackageFact, 0, len(act.packageFacts))
-	for k := range act.packageFacts {
-		facts = append(facts, analysis.PackageFact{k.pkg, act.packageFacts[k]})
-	}
-	return facts
 }
 
 func dbg(b byte) bool { return strings.IndexByte(Debug, b) >= 0 }
