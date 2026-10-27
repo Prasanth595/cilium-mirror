@@ -127,7 +127,7 @@ jobs:
   lvh-cache-key:
     name: LVH Cache Key
     # Same runner as the legs, so the key describes the packages they install.
-    runs-on: ${{ vars.UBUNTU_2604_4CPU_16GB || 'ubuntu-26.04' }}
+    runs-on: ${{ vars.GH_RUNNER_NV_M_4CORES_16GB_AMD64 || 'ubuntu-26.04' }}
     timeout-minutes: 20
     outputs:
       dependency-list-sha: ${{ steps.key.outputs.dependency_list_sha }}
@@ -143,7 +143,7 @@ jobs:
   setup-and-test:
     needs: [wait-for-images, generate-matrix, lvh-cache-key]
     name: 'Setup & Test'
-    runs-on: ${{ vars.UBUNTU_2604_4CPU_16GB || 'ubuntu-26.04' }}
+    runs-on: ${{ vars.GH_RUNNER_NV_M_4CORES_16GB_AMD64 || 'ubuntu-26.04' }}
     env:
       job_name: 'Setup & Test'
     strategy:
@@ -250,6 +250,15 @@ jobs:
           kernel: ${{ steps.kernel-version.outputs.full }}
           kind-params: "${{ steps.kind-params.outputs.params }}"
           kind-image: ${{ env.KIND_K8S_IMAGE }}
+          # Keep the credentials paired with the selected registry.
+          auth-required: ${{ vars.ARTIFACTORY_HOST != '' || vars.DOCKER_AUTH_REQUIRED == 'true' }}
+          login-host: ${{ vars.ARTIFACTORY_HOST || vars.DOCKER_READ_HOST }}
+          login-username: >-
+            ${{ (vars.ARTIFACTORY_HOST != '' && vars.ARTIFACTORY_USERNAME) ||
+                (vars.ARTIFACTORY_HOST == '' && vars.DOCKER_READ_USERNAME) || '' }}
+          login-password: >-
+            ${{ (vars.ARTIFACTORY_HOST != '' && secrets.ARTIFACTORY_ACCESS_TOKEN) ||
+                (vars.ARTIFACTORY_HOST == '' && secrets.DOCKER_READ_PASSWORD) || '' }}
 
       - name: Create imagePullSecret
         if: ${{ vars.DOCKER_AUTH_REQUIRED == 'true' && steps.cilium-config.outputs.skip != 'true' }}

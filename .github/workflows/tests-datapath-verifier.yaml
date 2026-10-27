@@ -79,7 +79,7 @@ jobs:
           sha: ${{ inputs.SHA || github.sha }}
 
   setup-and-test:
-    runs-on: ${{ vars.UBUNTU_2604_4CPU_16GB || 'ubuntu-26.04' }}
+    runs-on: ${{ vars.GH_RUNNER_NV_M_4CORES_16GB_AMD64 || 'ubuntu-26.04' }}
     name: Setup & Test
     strategy:
       fail-fast: false
