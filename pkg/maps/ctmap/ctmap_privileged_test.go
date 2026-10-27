@@ -5,9 +5,12 @@ package ctmap
 
 import (
 	"context"
+	"log/slog"
 	"math/rand/v2"
 	"net/netip"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
@@ -18,7 +21,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/cilium/pkg/bpf"
+	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/maps/nat"
+	"github.com/cilium/cilium/pkg/maps/timestamp"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/testutils"
 	"github.com/cilium/cilium/pkg/tuple"
@@ -38,6 +43,36 @@ func setupCTMap(tb testing.TB) {
 	bpf.CheckOrMountFS(logger, "")
 	err := rlimit.RemoveMemlock()
 	require.NoError(tb, err)
+}
+
+// newTestCtMap4 opens a global TCP4 CT map that is removed when the test ends.
+func newTestCtMap4(tb testing.TB) *Map {
+	tb.Helper()
+	setupCTMap(tb)
+
+	m := newMap(MapNameTCP4Global+"_test", mapTypeIPv4TCPGlobal)
+	require.NoError(tb, m.OpenOrCreate())
+	tb.Cleanup(func() {
+		assert.NoError(tb, m.Map.Unpin())
+		assert.NoError(tb, m.Map.Close())
+	})
+	return m
+}
+
+// newTestCtKey4 returns a TCP OUT key, with the ports used by the other GC tests.
+func newTestCtKey4(src, dst types.IPv4) *CtKey4Global {
+	return &CtKey4Global{
+		tuple.TupleKey4Global{
+			TupleKey4: tuple.TupleKey4{
+				SourceAddr: src,
+				DestAddr:   dst,
+				SourcePort: 0x3195,
+				DestPort:   0x50,
+				NextHeader: u8proto.TCP,
+				Flags:      tuple.TUPLE_F_OUT,
+			},
+		},
+	}
 }
 
 func BenchmarkMapBatchLookup(b *testing.B) {
@@ -438,8 +473,9 @@ func TestPrivilegedCtGcReopenedEntry(t *testing.T) {
 	})
 
 	t.Run("entry matched by IP is deleted regardless of Lifetime", func(t *testing.T) {
-		// scrubIPsInConntrackTableLocked() selects on IPs only, so a Lifetime
-		// refreshed past expiry after the batch read must not defer the delete.
+		// A filter that selects on IPs, like the endpoint scrub's, deletes
+		// regardless of Lifetime: a Lifetime refreshed past expiry after the
+		// batch read must not defer the delete.
 		err := ctMap.Map.Update(key, &CtEntry{Packets: 5, Bytes: 600, Lifetime: 50000})
 		require.NoError(t, err)
 
@@ -513,6 +549,99 @@ func TestPrivilegedCtGcReopenedEntry(t *testing.T) {
 		require.Equal(t, uint32(0), stats.aliveEntries)
 		require.Equal(t, uint32(0), stats.deleted)
 	})
+}
+
+// TestPrivilegedCtGcScrubRemovesExpired checks that the filter used by the
+// endpoint scrub deletes expired entries along with the ones matching its IPs.
+func TestPrivilegedCtGcScrubRemovesExpired(t *testing.T) {
+	ctMap := newTestCtMap4(t)
+
+	expired := newTestCtKey4(types.IPv4{10, 0, 0, 2}, types.IPv4{10, 0, 0, 1})
+	liveMatching := newTestCtKey4(types.IPv4{192, 168, 61, 12}, types.IPv4{192, 168, 61, 11})
+	liveOther := newTestCtKey4(types.IPv4{10, 0, 1, 2}, types.IPv4{10, 0, 1, 1})
+	require.NoError(t, ctMap.Map.Update(expired, &CtEntry{Lifetime: 0}))
+	require.NoError(t, ctMap.Map.Update(liveMatching, &CtEntry{Lifetime: MaxTime}))
+	require.NoError(t, ctMap.Map.Update(liveOther, &CtEntry{Lifetime: MaxTime}))
+
+	noop := func(GCEvent) {}
+	deleted, err := ctMap.GC(GCFilter{
+		RemoveExpired: true,
+		MatchIPs: map[NetAddr]struct{}{
+			{Addr: netip.MustParseAddr("192.168.61.11")}: {},
+		},
+	}, noop, noop)
+	require.NoError(t, err)
+	require.Equal(t, 2, deleted)
+
+	_, err = ctMap.Map.Lookup(expired)
+	require.ErrorIs(t, err, ebpf.ErrKeyNotExist, "expired entry must be deleted")
+	_, err = ctMap.Map.Lookup(liveMatching)
+	require.ErrorIs(t, err, ebpf.ErrKeyNotExist, "entry matching the IPs must be deleted")
+	_, err = ctMap.Map.Lookup(liveOther)
+	require.NoError(t, err, "live entry not matching the IPs must survive")
+}
+
+// TestPrivilegedCtGcCutoffAfterLock checks that the expiry cutoff is taken
+// once the GC holds the delete lock, not when it was requested: an entry that
+// expires while the GC is queued behind another delete must still be deleted.
+func TestPrivilegedCtGcCutoffAfterLock(t *testing.T) {
+	ctMap := newTestCtMap4(t)
+	noop := func(GCEvent) {}
+
+	// lockdebug panics on a nil logger in printStackTo (it still writes a
+	// stack trace to stderr after locks held >100ms). lock has no getter, so
+	// the cleanup resets to nil, assuming nothing else installed one.
+	lock.SetLogger(slog.New(slog.DiscardHandler))
+	t.Cleanup(func() { lock.SetLogger(nil) })
+
+	deleteLock := &globalDeleteLock[mapTypeIPv4TCPGlobal]
+	deleteLock.Lock()
+	unlock := sync.OnceFunc(deleteLock.UnlockIgnoreTime)
+
+	var wg sync.WaitGroup
+	var gcErr error
+	wg.Go(func() {
+		_, gcErr = ctMap.GC(GCFilter{RemoveExpired: true}, noop, noop)
+	})
+	// Release the lock on any exit and wait for the GC, so a failed run does
+	// not leave it blocked or running against a closed map.
+	t.Cleanup(func() {
+		unlock()
+		wg.Wait()
+	})
+
+	// The GC holds natMapLock once it is queued on the delete lock. The probe
+	// must run in a goroutine holding no locks (Eventually's does; under
+	// lockdebug go-deadlock would exit otherwise). Seed only after it
+	// succeeds: a GC that stamped its cutoff on entry would see the entry as
+	// live, and the test would fail.
+	natMapLock := mapInfo[mapTypeIPv4TCPGlobal].natMapLock
+	require.Eventually(t, func() bool {
+		if natMapLock.TryLock() {
+			natMapLock.UnlockIgnoreTime()
+			return false
+		}
+		return true
+	}, 20*time.Second, 10*time.Millisecond, "GC did not reach the delete lock")
+
+	now, err := timestamp.GetCTCurTime(timestamp.GetClockSourceFromOptions())
+	require.NoError(t, err)
+	key := newTestCtKey4(types.IPv4{10, 0, 0, 2}, types.IPv4{10, 0, 0, 1})
+	require.NoError(t, ctMap.Map.Update(key, &CtEntry{Lifetime: uint32(now)}))
+
+	// Wait until the CT clock has moved past the entry's lifetime. The clock
+	// ticks at a rate set by the clock source (jiffies are scaled).
+	require.Eventually(t, func() bool {
+		cur, err := timestamp.GetCTCurTime(timestamp.GetClockSourceFromOptions())
+		return err == nil && cur > now
+	}, 20*time.Second, 100*time.Millisecond, "CT clock did not advance")
+
+	unlock()
+	wg.Wait()
+	require.NoError(t, gcErr)
+
+	_, err = ctMap.Map.Lookup(key)
+	require.ErrorIs(t, err, ebpf.ErrKeyNotExist, "entry that expired while the GC was queued must be deleted")
 }
 
 // TestPrivilegedCtGcDsr tests whether DSR NAT entries are removed upon a removal of

@@ -6,6 +6,7 @@ package endpoint
 import (
 	"bytes"
 	"io"
+	"net/netip"
 	"os"
 	"testing"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/maps/ctmap"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/testutils"
@@ -120,6 +122,35 @@ func TestFirstRegenerationComputesPolicyOnce(t *testing.T) {
 			require.Equal(t, tc.recomputed, regenCtx.Stats.policyCalculation.Total() > 0)
 		})
 	}
+}
+
+type recordingGCRunner struct {
+	ctmap.GCRunner
+	filter ctmap.GCFilter
+}
+
+func (r *recordingGCRunner) Run(filter ctmap.GCFilter) (int, error) {
+	r.filter = filter
+	return 0, nil
+}
+
+func TestScrubIPsInConntrackTableLockedFilter(t *testing.T) {
+	gc := &recordingGCRunner{GCRunner: ctmap.NewFakeGCRunner()}
+	ep := &Endpoint{
+		ctMapGC: gc,
+		IPv4:    netip.MustParseAddr("10.0.0.1"),
+		IPv6:    netip.MustParseAddr("fd00::1"),
+	}
+
+	ep.scrubIPsInConntrackTableLocked()
+
+	require.Equal(t, ctmap.GCFilter{
+		RemoveExpired: true,
+		MatchIPs: map[ctmap.NetAddr]struct{}{
+			{Addr: ep.IPv4}: {},
+			{Addr: ep.IPv6}: {},
+		},
+	}, gc.filter)
 }
 
 func TestWriteInformationalComments(t *testing.T) {

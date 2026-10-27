@@ -168,7 +168,8 @@ type GCFilter struct {
 
 	// Time is the reference timestamp to remove expired entries. If
 	// RemoveExpired is true and lifetime is lesser than Time, the entry is
-	// removed
+	// removed. 0 with RemoveExpired means: take the current CT time once the
+	// delete lock is held.
 	Time uint32
 
 	// MatchIPs is the list of IPs to remove from the conntrack table
@@ -439,6 +440,10 @@ func (m *Map) doGCForFamily(filter GCFilter, next4, next6 func(GCEvent), ipv6 bo
 	// otherwise (*Endpoint).scrubIPsInConntrackTableLocked() may cause deletes
 	// to happen concurrently.
 	globalDeleteLock[m.mapType].Lock()
+	if filter.RemoveExpired && filter.Time == 0 {
+		now, _ := timestamp.GetCTCurTime(timestamp.GetClockSourceFromOptions())
+		filter.Time = uint32(now)
+	}
 	if ipv6 {
 		filterCallback := m.cleanup(filter, natMap, &stats, next6, ipv6)
 		stats.dumpError = iterate[CtKey6Global, CtEntry](m, &stats, filterCallback)
@@ -596,20 +601,11 @@ func (f GCFilter) doFiltering(srcIP, dstIP NetAddr, srcPort, dstPort uint16, nex
 	return noAction
 }
 
-func (m *Map) doGC(filter GCFilter, next4, next6 func(GCEvent)) (int, error) {
-	stats := m.doGCForFamily(filter, next4, next6, m.mapType.isIPv6())
-	return int(stats.deleted), stats.dumpError
-}
-
 // GC runs garbage collection for map m with name mapType with the given filter.
 // It returns how many items were deleted from m.
 func (m *Map) GC(filter GCFilter, next4, next6 func(GCEvent)) (int, error) {
-	if filter.RemoveExpired {
-		t, _ := timestamp.GetCTCurTime(timestamp.GetClockSourceFromOptions())
-		filter.Time = uint32(t)
-	}
-
-	return m.doGC(filter, next4, next6)
+	stats := m.doGCForFamily(filter, next4, next6, m.mapType.isIPv6())
+	return int(stats.deleted), stats.dumpError
 }
 
 // PurgeOrphanNATEntries removes orphan SNAT entries. We call an SNAT entry
@@ -744,7 +740,7 @@ func PurgeOrphanNATEntries(ctMapTCP, ctMapAny *Map) *NatGCStats {
 // Flush runs garbage collection for map m with the name mapType, deleting all
 // entries. The specified map must be already opened using bpf.OpenMap().
 func (m *Map) Flush(next4, next6 func(GCEvent)) int {
-	d, _ := m.doGC(GCFilter{
+	d, _ := m.GC(GCFilter{
 		RemoveExpired: true,
 		Time:          MaxTime,
 	}, next4, next6)
