@@ -301,7 +301,9 @@ cilium-agent [flags]
       --ipam-default-ip-pool string                               Name of the default IP Pool when using multi-pool (default "default")
       --ipam-max-allocate int                                     Maximum number of IPs that can be allocated at the node level
       --ipam-min-allocate int                                     Minimum number of IPs that must be allocated when the node is first bootstrapped at the node level
+      --ipam-multi-pool-excess-cidr-release-delay duration        When using a multi-pool backed IPAM mode with ipam-multi-pool-release-excess-cidrs, how long a CIDR has to stay unused before it is released.
       --ipam-multi-pool-pre-allocation map                        Defines the minimum number of IPs a node should pre-allocate from each pool (default default=8)
+      --ipam-multi-pool-release-excess-cidrs                      When using a multi-pool backed IPAM mode, release unused CIDRs which are not needed to satisfy the pre-allocation. If disabled, CIDRs assigned to the node are never released. (default true)
       --ipam-pre-allocate int                                     Number of IP addresses that must be available for allocation in the IPAMspec at the node level
       --ipam-static-ip-tags stringToString                        List of tags to determine the pool of IPs from which to attribute a static IP to the node at the node level, this currently works with AWS and Azure (default [])
       --ipsec-key-file string                                     Path to IPsec key file

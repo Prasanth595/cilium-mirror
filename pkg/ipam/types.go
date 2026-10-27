@@ -138,6 +138,8 @@ type IPAM struct {
 
 	onlyMasqueradeDefaultPool bool
 
+	multiPoolCIDRRelease CIDRReleaseConfig
+
 	// cloudProviders holds the registered cloud providers, keyed by the IPAM
 	// mode each one handles.
 	cloudProviders map[string]CloudProvider
