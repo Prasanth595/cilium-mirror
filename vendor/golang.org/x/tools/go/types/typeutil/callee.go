@@ -8,39 +8,26 @@ import (
 	"go/ast"
 	"go/types"
 
-	"golang.org/x/tools/go/ast/astutil"
+	"golang.org/x/tools/internal/typesinternal"
 )
 
 // Callee returns the named target of a function call, if any:
 // a function, method, builtin, or variable.
+// It returns nil for a T(x) conversion.
+//
+// Functions and methods may potentially have type parameters.
+//
+// Note: for calls of instantiated functions and methods, Callee returns
+// the corresponding generic function or method on the generic type.
 func Callee(info *types.Info, call *ast.CallExpr) types.Object {
-	var obj types.Object
-	switch fun := astutil.Unparen(call.Fun).(type) {
-	case *ast.Ident:
-		obj = info.Uses[fun] // type, var, builtin, or declared func
-	case *ast.SelectorExpr:
-		if sel, ok := info.Selections[fun]; ok {
-			obj = sel.Obj() // method or field
-		} else {
-			obj = info.Uses[fun.Sel] // qualified identifier?
-		}
-	}
-	if _, ok := obj.(*types.TypeName); ok {
-		return nil // T(x) is a conversion, not a call
-	}
-	return obj
+	return typesinternal.Callee(info, call)
 }
 
-// StaticCallee returns the target (function or method) of a static
-// function call, if any. It returns nil for calls to builtins.
+// StaticCallee returns the target (function or method) of a static function
+// call, if any. It returns nil for calls to builtins.
+//
+// Note: for calls of instantiated functions and methods, StaticCallee returns
+// the corresponding generic function or method on the generic type.
 func StaticCallee(info *types.Info, call *ast.CallExpr) *types.Func {
-	if f, ok := Callee(info, call).(*types.Func); ok && !interfaceMethod(f) {
-		return f
-	}
-	return nil
-}
-
-func interfaceMethod(f *types.Func) bool {
-	recv := f.Type().(*types.Signature).Recv()
-	return recv != nil && types.IsInterface(recv.Type())
+	return typesinternal.StaticCallee(info, call)
 }
