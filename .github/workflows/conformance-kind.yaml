@@ -58,7 +58,7 @@ jobs:
           cilium version
 
       - name: Checkout king config
-        uses: actions/checkout@ec3a7ce113134d7a93b817d10a8272cb61118579
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
